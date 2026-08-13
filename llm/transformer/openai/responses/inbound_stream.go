@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"sort"
 	"strings"
 
 	"github.com/samber/lo"
@@ -50,6 +51,7 @@ type responsesInboundStream struct {
 	hasContentPartStarted   bool
 	hasFinished             bool
 	responseCompleted       bool
+	finishReason            string
 	pendingAnnotations      []llm.Annotation
 
 	// Response metadata
@@ -76,6 +78,7 @@ type responsesInboundStream struct {
 	currentToolCallIdx  int
 	toolCallItemStarted map[int]bool
 	toolCallOutputIndex map[int]int // Maps tool call index to output index
+	toolCallItemID      map[int]string
 
 	// Response accumulation using streamAggregator
 	usage               *llm.Usage
@@ -83,6 +86,7 @@ type responsesInboundStream struct {
 	transformerMetadata map[string]any
 	responseHeaders     http.Header
 	responseHeadersSent bool
+	echoResponse        *Response
 
 	// Event queue
 	eventQueue []*httpclient.StreamEvent
@@ -140,7 +144,29 @@ func (s *responsesInboundStream) Next() bool {
 
 	// Try to get the next chunk from source
 	if !s.source.Next() {
-		if s.err == nil && !s.errorEventEmitted && s.source.Err() == nil && s.hasFinished {
+		if s.err == nil && !s.errorEventEmitted && s.source.Err() == nil && !s.responseCompleted {
+			if !s.hasFinished {
+				// The upstream ended cleanly without a finish chunk. Close any
+				// open output items and synthesize the terminal event so clients
+				// do not see an abruptly truncated SSE stream.
+				if !s.hasResponseCreated {
+					return s.emitStreamErrorEvent(errors.New("upstream stream ended without producing any response event")) == nil
+				}
+				if err := s.flushPendingReasoning(); err != nil {
+					s.err = err
+					return false
+				}
+				if err := s.closeCurrentContentPart(); err != nil {
+					s.err = err
+					return false
+				}
+				if err := s.closeCurrentOutputItem(); err != nil {
+					s.err = err
+					return false
+				}
+				s.hasFinished = true
+			}
+
 			if err := s.enqueueTerminalResponse(); err != nil {
 				s.err = err
 				return false
@@ -216,6 +242,7 @@ func (s *responsesInboundStream) Next() bool {
 
 	if len(chunk.TransformerMetadata) > 0 {
 		s.mergeTransformerMetadata(chunk.TransformerMetadata)
+		s.captureEchoFields(chunk.TransformerMetadata)
 	}
 
 	// Generate response.created event if this is the first chunk
@@ -230,6 +257,7 @@ func (s *responsesInboundStream) Next() bool {
 			Status:    lo.ToPtr("in_progress"),
 			Output:    []Item{},
 		}
+		applyEchoFields(response, s.echoResponse)
 
 		if s.usage != nil {
 			response.Usage = ConvertLLMUsageToResponsesUsage(s.usage)
@@ -306,6 +334,8 @@ func (s *responsesInboundStream) Next() bool {
 		// Handle finish reason
 		if choice.FinishReason != nil && !s.hasFinished {
 			s.hasFinished = true
+			s.finishReason = *choice.FinishReason
+			abnormalFinish := isAbnormalResponsesFinishReason(s.finishReason)
 
 			// Map the finish_reason to the final Responses status and event type.
 			switch *choice.FinishReason {
@@ -332,9 +362,14 @@ func (s *responsesInboundStream) Next() bool {
 				return false
 			}
 
-			// Close any open output items
-			if err := s.closeCurrentOutputItem(); err != nil {
-				s.err = err
+			var closeErr error
+			if abnormalFinish {
+				closeErr = s.closeCurrentNonToolOutputItem()
+			} else {
+				closeErr = s.closeCurrentOutputItem()
+			}
+			if closeErr != nil {
+				s.err = closeErr
 				return false
 			}
 		}
@@ -346,6 +381,8 @@ func (s *responsesInboundStream) Next() bool {
 	// chunk, including the one carrying finish_reason; finalizing there would emit the
 	// placeholder zeros and drop the real counts arriving afterwards.
 	if chunk.Usage != nil && len(chunk.Choices) == 0 && s.hasFinished && !s.responseCompleted {
+		s.usage = chunk.Usage
+
 		if err := s.enqueueTerminalResponse(); err != nil {
 			s.err = err
 			return false
@@ -356,12 +393,29 @@ func (s *responsesInboundStream) Next() bool {
 	return s.Next()
 }
 
+func isAbnormalResponsesFinishReason(reason string) bool {
+	switch reason {
+	case "length", "content_filter", "error", "cancelled", "canceled":
+		return true
+	default:
+		return false
+	}
+}
+
 // enqueueTerminalResponse serves both the final usage chunk and clean stream end.
 func (s *responsesInboundStream) enqueueTerminalResponse() error {
 	if s.aggregator.status == "" || s.aggregator.status == "in_progress" {
 		s.aggregator.status = "completed"
 	}
 	response := s.aggregator.buildResponse()
+	applyEchoFields(response, s.echoResponse)
+	if s.aggregator.status == "incomplete" && response.IncompleteDetails == nil {
+		reason := "max_output_tokens"
+		if s.finishReason == "content_filter" {
+			reason = "content_filter"
+		}
+		response.IncompleteDetails = &ResponseIncompleteDetails{Reason: reason}
+	}
 	if s.usage != nil {
 		response.Usage = ConvertLLMUsageToResponsesUsage(s.usage)
 	}
@@ -454,6 +508,21 @@ func (s *responsesInboundStream) attachResponseHeaders(event *httpclient.StreamE
 
 	event.Headers = s.responseHeaders.Clone()
 	s.responseHeadersSent = true
+}
+
+// captureEchoFields extracts the upstream Response echo fields from
+// TransformerMetadata so they can be restored on rebuilt response events.
+func (s *responsesInboundStream) captureEchoFields(metadata map[string]any) {
+	if len(metadata) == 0 {
+		return
+	}
+	raw, ok := metadata[responsesEchoFieldsTransformerMetadataKey]
+	if !ok || raw == nil {
+		return
+	}
+	if echo, ok := raw.(*Response); ok {
+		s.echoResponse = echo
+	}
 }
 
 func getResponsesReasoningItemMetadata(metadata map[string]any) (responsesReasoningItemMetadata, bool) {
@@ -792,6 +861,9 @@ func (s *responsesInboundStream) handleToolCalls(toolCalls []llm.ToolCall) error
 	if s.toolCallOutputIndex == nil {
 		s.toolCallOutputIndex = make(map[int]int)
 	}
+	if s.toolCallItemID == nil {
+		s.toolCallItemID = make(map[int]string)
+	}
 
 	for _, tc := range toolCalls {
 		toolCallIndex := tc.Index
@@ -802,9 +874,31 @@ func (s *responsesInboundStream) handleToolCalls(toolCalls []llm.ToolCall) error
 				return err
 			}
 		}
+		state := s.toolCalls[toolCallIndex]
+		stateKind := responsesToolCallKind(state)
+		deltaKind := responsesToolCallKind(&tc)
+		if stateKind != deltaKind {
+			return fmt.Errorf("tool call index %d changed type from %s to %s", toolCallIndex, stateKind, deltaKind)
+		}
+		if state.ID == "" && tc.ID != "" {
+			state.ID = tc.ID
+			if state.ResponseCustomToolCall != nil {
+				state.ResponseCustomToolCall.CallID = tc.ID
+			}
+			if state.ResponseToolSearchCall != nil {
+				state.ResponseToolSearchCall.CallID = tc.ID
+			}
+		}
+		if state.ResponseCustomToolCall != nil && state.ResponseCustomToolCall.Name == "" && tc.ResponseCustomToolCall != nil {
+			state.ResponseCustomToolCall.Name = tc.ResponseCustomToolCall.Name
+		}
 
 		// Process delta based on tool type
 		switch {
+		case tc.ResponseToolSearchCall != nil:
+			if err := s.handleToolSearchCallDelta(tc); err != nil {
+				return err
+			}
 		case tc.ResponseCustomToolCall != nil:
 			if err := s.handleCustomToolCallDelta(tc); err != nil {
 				return err
@@ -819,6 +913,18 @@ func (s *responsesInboundStream) handleToolCalls(toolCalls []llm.ToolCall) error
 	return nil
 }
 
+// responsesToolCallKind returns the lifecycle kind represented by one unified tool call.
+func responsesToolCallKind(call *llm.ToolCall) string {
+	switch {
+	case call.ResponseToolSearchCall != nil:
+		return "tool_search"
+	case call.ResponseCustomToolCall != nil:
+		return "custom"
+	default:
+		return "function"
+	}
+}
+
 func (s *responsesInboundStream) initToolCall(tc llm.ToolCall) error {
 	toolCallIndex := tc.Index
 
@@ -826,15 +932,22 @@ func (s *responsesInboundStream) initToolCall(tc llm.ToolCall) error {
 		return err
 	}
 
-	if err := s.closeCurrentOutputItem(); err != nil {
-		return err
+	var customCall *llm.ResponseCustomToolCall
+	if tc.ResponseCustomToolCall != nil {
+		customCall = &llm.ResponseCustomToolCall{CallID: tc.ResponseCustomToolCall.CallID, Name: tc.ResponseCustomToolCall.Name}
+	}
+	var toolSearchCall *llm.ResponseToolSearchCall
+	if tc.ResponseToolSearchCall != nil {
+		toolSearchCall = &llm.ResponseToolSearchCall{CallID: tc.ResponseToolSearchCall.CallID, Execution: tc.ResponseToolSearchCall.Execution}
 	}
 
 	s.toolCalls[toolCallIndex] = &llm.ToolCall{
 		Index:                  toolCallIndex,
 		ID:                     tc.ID,
 		Type:                   tc.Type,
-		ResponseCustomToolCall: tc.ResponseCustomToolCall,
+		ResponseCustomToolCall: customCall,
+		ResponseToolSearchCall: toolSearchCall,
+		TransformerMetadata:    tc.TransformerMetadata,
 		Function: llm.FunctionCall{
 			Name:      tc.Function.Name,
 			Namespace: tc.Function.Namespace,
@@ -845,7 +958,8 @@ func (s *responsesInboundStream) initToolCall(tc llm.ToolCall) error {
 	// A Responses function_call must include its name in output_item.added for
 	// clients to route it. Some upstreams provide that identity only in a later
 	// arguments delta or done event, so retain the call until it is known.
-	if tc.ResponseCustomToolCall == nil && tc.Function.Name == "" {
+	// Custom and tool-search calls carry their identity from the first chunk.
+	if tc.ResponseCustomToolCall == nil && tc.ResponseToolSearchCall == nil && tc.Function.Name == "" {
 		return nil
 	}
 
@@ -865,6 +979,14 @@ func (s *responsesInboundStream) startToolCallItem(toolCallIndex int) error {
 	}
 
 	switch {
+	case tc.ResponseToolSearchCall != nil:
+		item := &Item{
+			ID: itemID, Type: "tool_search_call", Status: lo.ToPtr("in_progress"),
+			CallID: tc.ResponseToolSearchCall.CallID, Execution: tc.ResponseToolSearchCall.Execution,
+		}
+		if err := s.enqueueEvent(&StreamEvent{Type: StreamEventTypeOutputItemAdded, OutputIndex: s.outputIndex, Item: item}); err != nil {
+			return fmt.Errorf("failed to enqueue output_item.added event: %w", err)
+		}
 	case tc.ResponseCustomToolCall != nil:
 		item := &Item{
 			ID:     itemID,
@@ -906,6 +1028,7 @@ func (s *responsesInboundStream) startToolCallItem(toolCallIndex int) error {
 
 	s.toolCallItemStarted[toolCallIndex] = true
 	s.toolCallOutputIndex[toolCallIndex] = s.outputIndex
+	s.toolCallItemID[toolCallIndex] = itemID
 	s.currentItemID = itemID
 	s.outputIndex++
 
@@ -945,10 +1068,7 @@ func (s *responsesInboundStream) handleFunctionCallDelta(tc llm.ToolCall) error 
 	}
 
 	if argumentsToEmit != "" {
-		itemID := storedToolCall.ID
-		if itemID == "" {
-			itemID = s.currentItemID
-		}
+		itemID := s.toolCallItemID[toolCallIndex]
 
 		err := s.enqueueEvent(&StreamEvent{
 			Type:         StreamEventTypeFunctionCallArgumentsDelta,
@@ -967,13 +1087,20 @@ func (s *responsesInboundStream) handleFunctionCallDelta(tc llm.ToolCall) error 
 
 func (s *responsesInboundStream) handleCustomToolCallDelta(tc llm.ToolCall) error {
 	toolCallIndex := tc.Index
-	s.toolCalls[toolCallIndex].ResponseCustomToolCall.Input += tc.ResponseCustomToolCall.Input
+	state := s.toolCalls[toolCallIndex]
+	state.ResponseCustomToolCall.Input += tc.ResponseCustomToolCall.Input
+	if wrapped, _ := tc.TransformerMetadata["openai_responses_chat_wrapped_custom"].(bool); wrapped {
+		if state.TransformerMetadata == nil {
+			state.TransformerMetadata = map[string]any{}
+		}
+		state.TransformerMetadata["openai_responses_chat_wrapped_custom"] = true
+	}
+	if wrapped, _ := state.TransformerMetadata["openai_responses_chat_wrapped_custom"].(bool); wrapped {
+		return nil
+	}
 
 	if tc.ResponseCustomToolCall.Input != "" {
-		itemID := s.toolCalls[toolCallIndex].ID
-		if itemID == "" {
-			itemID = s.currentItemID
-		}
+		itemID := s.toolCallItemID[toolCallIndex]
 
 		err := s.enqueueEvent(&StreamEvent{
 			Type:        StreamEventTypeCustomToolCallInputDelta,
@@ -986,6 +1113,25 @@ func (s *responsesInboundStream) handleCustomToolCallDelta(tc llm.ToolCall) erro
 		}
 	}
 
+	return nil
+}
+
+// handleToolSearchCallDelta emits lifecycle events for a client tool-search call.
+func (s *responsesInboundStream) handleToolSearchCallDelta(tc llm.ToolCall) error {
+	toolCallIndex := tc.Index
+	state := s.toolCalls[toolCallIndex].ResponseToolSearchCall
+	state.Arguments += tc.ResponseToolSearchCall.Arguments
+	if tc.ResponseToolSearchCall.Arguments == "" {
+		return nil
+	}
+	itemID := s.toolCallItemID[toolCallIndex]
+	if err := s.enqueueEvent(&StreamEvent{
+		Type: StreamEventTypeFunctionCallArgumentsDelta, ItemID: &itemID,
+		OutputIndex: s.toolCallOutputIndex[toolCallIndex], ContentIndex: lo.ToPtr(0),
+		Delta: tc.ResponseToolSearchCall.Arguments,
+	}); err != nil {
+		return fmt.Errorf("failed to enqueue tool_search_call arguments delta: %w", err)
+	}
 	return nil
 }
 
@@ -1051,6 +1197,7 @@ func (s *responsesInboundStream) closeReasoningItem() error {
 	item := Item{
 		ID:               s.currentItemID,
 		Type:             "reasoning",
+		Status:           lo.ToPtr("completed"),
 		Summary:          summary,
 		EncryptedContent: encryptedContent,
 	}
@@ -1179,20 +1326,68 @@ func (s *responsesInboundStream) closeCurrentOutputItem() error {
 	}
 
 	// Close any open tool call items
-	for idx, tc := range s.toolCalls {
+	toolCallIndexes := lo.Keys(s.toolCalls)
+	sort.Ints(toolCallIndexes)
+	for _, idx := range toolCallIndexes {
+		tc := s.toolCalls[idx]
 		if !s.toolCallItemStarted[idx] {
 			continue
 		}
 
-		itemID := tc.ID
+		itemID := s.toolCallItemID[idx]
+		if itemID == "" {
+			itemID = tc.ID
+		}
 		if itemID == "" {
 			itemID = s.currentItemID
 		}
 
 		switch {
+		case tc.ResponseToolSearchCall != nil:
+			arguments := tc.ResponseToolSearchCall.Arguments
+			if err := s.enqueueEvent(&StreamEvent{
+				Type: StreamEventTypeFunctionCallArgumentsDone, ItemID: &itemID,
+				OutputIndex: s.toolCallOutputIndex[idx], Arguments: arguments,
+			}); err != nil {
+				return fmt.Errorf("failed to enqueue tool_search_call arguments done: %w", err)
+			}
+			item := Item{
+				ID: itemID, Type: "tool_search_call", Status: lo.ToPtr("completed"),
+				CallID: tc.ResponseToolSearchCall.CallID, Execution: tc.ResponseToolSearchCall.Execution,
+				Arguments: arguments,
+			}
+			if err := s.enqueueEvent(&StreamEvent{Type: StreamEventTypeOutputItemDone, OutputIndex: s.toolCallOutputIndex[idx], Item: &item}); err != nil {
+				return fmt.Errorf("failed to enqueue output_item.done event: %w", err)
+			}
 		case tc.ResponseCustomToolCall != nil:
 			// Custom tool call - emit custom_tool_call_input.done then output_item.done
 			fullInput := tc.ResponseCustomToolCall.Input
+			if wrapped, _ := tc.TransformerMetadata["openai_responses_chat_wrapped_custom"].(bool); wrapped {
+				var input struct {
+					Input *string `json:"input"`
+				}
+				if err := json.Unmarshal([]byte(fullInput), &input); err != nil {
+					slog.WarnContext(s.ctx, "failed to unwrap Chat custom tool input",
+						slog.String("call_id", tc.ResponseCustomToolCall.CallID),
+						slog.Any("error", err))
+					// Some compatible providers ignore the wrapper schema and emit raw
+					// custom input. Preserve it, matching the non-streaming fallback.
+				} else if input.Input == nil {
+					slog.WarnContext(s.ctx, "failed to unwrap Chat custom tool input",
+						slog.String("call_id", tc.ResponseCustomToolCall.CallID),
+						slog.String("error", "missing input field"))
+				} else {
+					fullInput = *input.Input
+				}
+				if fullInput != "" {
+					if err := s.enqueueEvent(&StreamEvent{
+						Type: StreamEventTypeCustomToolCallInputDelta, ItemID: &itemID,
+						OutputIndex: s.toolCallOutputIndex[idx], Delta: fullInput,
+					}); err != nil {
+						return fmt.Errorf("failed to enqueue custom_tool_call_input.delta event: %w", err)
+					}
+				}
+			}
 
 			err := s.enqueueEvent(&StreamEvent{
 				Type:        StreamEventTypeCustomToolCallInputDone,
@@ -1261,6 +1456,14 @@ func (s *responsesInboundStream) closeCurrentOutputItem() error {
 	}
 
 	return nil
+}
+
+func (s *responsesInboundStream) closeCurrentNonToolOutputItem() error {
+	started := s.toolCallItemStarted
+	s.toolCallItemStarted = nil
+	err := s.closeCurrentOutputItem()
+	s.toolCallItemStarted = started
+	return err
 }
 
 func (s *responsesInboundStream) emitStreamErrorEvent(err error) error {
@@ -1344,6 +1547,7 @@ func (s *responsesInboundStream) buildFailedResponse(code, message string) *Resp
 			Message: message,
 		},
 	}
+	applyEchoFields(response, s.echoResponse)
 
 	if s.aggregator != nil {
 		aggregated := s.aggregator.buildResponse()

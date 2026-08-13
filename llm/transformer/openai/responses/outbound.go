@@ -209,6 +209,10 @@ func (t *OutboundTransformer) TransformRequest(ctx context.Context, llmReq *llm.
 		return nil, fmt.Errorf("chat request is nil")
 	}
 
+	requestCopy := *llmReq
+	requestCopy.TransformerMetadata = maps.Clone(llmReq.TransformerMetadata)
+	llmReq = &requestCopy
+
 	originalRequestType := llmReq.RequestType
 	isImageRequest := originalRequestType == llm.RequestTypeImage
 
@@ -238,8 +242,13 @@ func (t *OutboundTransformer) TransformRequest(ctx context.Context, llmReq *llm.
 
 	var tools []Tool
 	namespaceIndexes := make(map[string]int)
+	requestExt := openAIResponsesRequestExtensions(llmReq)
+	replayRawInput := rawInputReplayMatchesCurrent(requestExt, llmReq.Messages, llmReq.Tools)
 	// Convert tools to Responses API format
 	for _, item := range llmReq.Tools {
+		if !responsesOriginToolEmitsTopLevel(item, replayRawInput) {
+			continue
+		}
 		switch item.Type {
 		case llm.ToolTypeImageGeneration:
 			tool := convertImageGenerationToTool(item)
@@ -255,6 +264,20 @@ func (t *OutboundTransformer) TransformRequest(ctx context.Context, llmReq *llm.
 		case llm.ToolTypeResponsesCustomTool:
 			tool := convertCustomToTool(item)
 			tools = append(tools, tool)
+		case llm.ToolTypeResponsesToolSearch:
+			if item.ResponseToolSearch == nil {
+				continue
+			}
+			parameters := map[string]any{}
+			if len(item.ResponseToolSearch.Parameters) > 0 {
+				if err := json.Unmarshal(item.ResponseToolSearch.Parameters, &parameters); err != nil {
+					return nil, fmt.Errorf("failed to decode tool search parameters: %w", err)
+				}
+			}
+			tools = append(tools, Tool{
+				Type: "tool_search", Execution: item.ResponseToolSearch.Execution,
+				Description: item.ResponseToolSearch.Description, Parameters: parameters,
+			})
 		case "function":
 			tool := convertFunctionToTool(item)
 			if namespace := item.Function.Namespace; namespace != "" {
@@ -272,11 +295,15 @@ func (t *OutboundTransformer) TransformRequest(ctx context.Context, llmReq *llm.
 			continue
 		}
 	}
+	payloadMessages, err := synchronizeToolSearchOutputMessages(llmReq.Messages, llmReq.Tools, requestExt)
+	if err != nil {
+		return nil, fmt.Errorf("failed to synchronize tool search output definitions: %w", err)
+	}
 
 	payload := Request{
 		Model:                llmReq.Model,
-		Input:                convertInputFromMessages(llmReq.Messages, llmReq.TransformOptions),
-		Instructions:         convertInstructionsFromMessages(llmReq.Messages),
+		Input:                convertInputFromMessages(payloadMessages, llmReq.TransformOptions),
+		Instructions:         convertInstructionsFromMessages(payloadMessages),
 		Tools:                tools,
 		ParallelToolCalls:    llmReq.ParallelToolCalls,
 		Stream:               llmReq.Stream,

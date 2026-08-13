@@ -14,6 +14,16 @@ import (
 	"github.com/looplj/axonhub/llm/auth"
 )
 
+func TestOutboundTransformer_ResponsesRequestCapabilities(t *testing.T) {
+	outbound, err := NewOutboundTransformer("https://api.example.com/v1", "test-api-key")
+	require.NoError(t, err)
+
+	provider, ok := outbound.(*OutboundTransformer)
+	require.True(t, ok)
+	require.True(t, provider.ResponsesRequestCapabilities(&llm.Request{}).ChatToolLifecycle)
+	require.False(t, provider.ResponsesRequestCapabilities(&llm.Request{RequestType: llm.RequestTypeCompact}).ChatToolLifecycle)
+}
+
 func TestOutboundTransformer_TransformRequest_URL(t *testing.T) {
 	// Helper function to create transformer
 	createTransformer := func(baseURL, apiKey string) *OutboundTransformer {
