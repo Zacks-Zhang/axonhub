@@ -412,7 +412,11 @@ func marshalRequestPayload(payload Request, llmReq *llm.Request) ([]byte, error)
 	}
 	mergeRawRequestFields(obj, requestExt)
 
-	if tools, ok := mergeRawOnlyTools(obj["tools"], requestExt, llmReq.Messages, llmReq.Tools); ok {
+	// Compute once: replay matching re-marshals every message and tool, so
+	// both raw merges share the same verdict.
+	replayRawInput := rawInputReplayMatchesCurrent(requestExt, llmReq.Messages, llmReq.Tools)
+
+	if tools, ok := mergeRawOnlyTools(obj["tools"], requestExt, llmReq.Tools, replayRawInput); ok {
 		toolsRaw, err := json.Marshal(tools)
 		if err != nil {
 			return nil, err
@@ -424,14 +428,12 @@ func marshalRequestPayload(payload Request, llmReq *llm.Request) ([]byte, error)
 		obj["tool_choice"] = cloneRaw(requestExt.RawToolChoice)
 	}
 
-	if rawInputReplayMatchesCurrent(requestExt, llmReq.Messages, llmReq.Tools) {
-		if input, ok := mergeRawOnlyInputItems(obj["input"], requestExt); ok {
-			inputRaw, err := json.Marshal(input)
-			if err != nil {
-				return nil, err
-			}
-			obj["input"] = inputRaw
+	if input, ok := mergeRawOnlyInputItems(obj["input"], requestExt, replayRawInput); ok {
+		inputRaw, err := json.Marshal(input)
+		if err != nil {
+			return nil, err
 		}
+		obj["input"] = inputRaw
 	}
 
 	return json.Marshal(obj)
@@ -465,7 +467,8 @@ func marshalCompactRequestPayload(payload CompactAPIRequest, llmReq *llm.Request
 		return nil, err
 	}
 	mergeRawRequestFields(obj, requestExt)
-	if input, ok := mergeRawOnlyInputItems(obj["input"], requestExt); ok {
+	replayRawInput := rawInputReplayMatchesCurrent(requestExt, llmReq.Messages, llmReq.Tools)
+	if input, ok := mergeRawOnlyInputItems(obj["input"], requestExt, replayRawInput); ok {
 		inputRaw, err := json.Marshal(input)
 		if err != nil {
 			return nil, err
@@ -479,8 +482,15 @@ func marshalCompactRequestPayload(payload CompactAPIRequest, llmReq *llm.Request
 // mergeRawOnlyInputItems rebuilds the outgoing `input` array from the merged
 // request: items rebuilt from messages and raw items that had no representation
 // are interleaved back into the positions they were sent in.
-func mergeRawOnlyInputItems(structuredRaw json.RawMessage, requestExt *llm.OpenAIResponsesRequestExtensions) ([]json.RawMessage, bool) {
+func mergeRawOnlyInputItems(
+	structuredRaw json.RawMessage,
+	requestExt *llm.OpenAIResponsesRequestExtensions,
+	replayRawInput bool,
+) ([]json.RawMessage, bool) {
 	if requestExt == nil || (len(requestExt.RawInputItems) == 0 && len(requestExt.OmittedInputItemIndices) == 0) {
+		return nil, false
+	}
+	if !replayRawInput {
 		return nil, false
 	}
 
@@ -547,8 +557,8 @@ func mergeRawOnlyInputItems(structuredRaw json.RawMessage, requestExt *llm.OpenA
 func mergeRawOnlyTools(
 	structuredRaw json.RawMessage,
 	requestExt *llm.OpenAIResponsesRequestExtensions,
-	currentMessages []llm.Message,
 	currentTools []llm.Tool,
+	replayRawInput bool,
 ) ([]json.RawMessage, bool) {
 	if requestExt == nil || len(requestExt.RawTools) == 0 {
 		return nil, false
@@ -585,7 +595,6 @@ func mergeRawOnlyTools(
 	}
 
 	currentSignatures := replayToolSignatures(currentTools)
-	replayRawInput := rawInputReplayMatchesCurrent(requestExt, currentMessages, currentTools)
 	tools := make([]json.RawMessage, 0, len(structuredTools)+len(groups))
 	structuredIndex := 0
 	replayed := false
