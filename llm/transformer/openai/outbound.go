@@ -74,8 +74,10 @@ type OutboundTransformer struct {
 	config *Config
 }
 
-var _ transformer.ResponsesChatToolLifecycleCapable = (*OutboundTransformer)(nil)
-var _ transformer.ResponsesRequestCapabilitiesProvider = (*OutboundTransformer)(nil)
+var (
+	_ transformer.ResponsesChatToolLifecycleCapable    = (*OutboundTransformer)(nil)
+	_ transformer.ResponsesRequestCapabilitiesProvider = (*OutboundTransformer)(nil)
+)
 
 // NewOutboundTransformer creates a new OpenAI OutboundTransformer with legacy parameters.
 func NewOutboundTransformer(baseURL, apiKey string) (transformer.Outbound, error) {
@@ -221,7 +223,7 @@ func (t *OutboundTransformer) TransformRequest(ctx context.Context, llmReq *llm.
 		var err error
 		oaiReq, toolAdapter, err = requestFromLLMWithResponsesToolAdapter(llmReq, reasoningField)
 		if err != nil {
-			return nil, fmt.Errorf("%w: failed to convert Responses tools to Chat Completions: %v", transformer.ErrInvalidRequest, err)
+			return nil, fmt.Errorf("%w: failed to convert Responses tools to Chat Completions: %w", transformer.ErrInvalidRequest, err)
 		}
 		applySessionPromptCacheKey(ctx, oaiReq)
 	} else {

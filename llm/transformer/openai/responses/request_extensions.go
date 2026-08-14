@@ -615,7 +615,7 @@ func mergeRawOnlyTools(
 			group := &groups[matchedGroup]
 			group.used = true
 			tools = append(tools, cloneRaw(group.fragment.Raw))
-			for i := 0; i < len(group.signatures); i++ {
+			for i := range len(group.signatures) {
 				if responsesToolEmitsStructured(currentTools[toolIndex+i], replayRawInput) {
 					structuredIndex++
 				}
