@@ -1064,24 +1064,3 @@ func (r *Resolver) Segment() SegmentResolver { return &segmentResolver{r} }
 type channelSettingsResolver struct{ *Resolver }
 type mutationResolver struct{ *Resolver }
 type segmentResolver struct{ *Resolver }
-
-// !!! WARNING !!!
-// The code below was going to be deleted when updating resolvers. It has been copied here so you have
-// one last chance to move it out of harms way if you want. There are two reasons this happens:
-//  - When renaming or deleting a resolver the old code will be put in here. You can safely delete
-//    it when you're done.
-//  - You have helper methods in this file. Move them out to keep these resolver files clean.
-/*
-	func (r *transformOptionsResolver) EnableResponsesChatCompat(ctx context.Context, obj *objects.TransformOptions) (bool, error) {
-	panic(fmt.Errorf("not implemented: EnableResponsesChatCompat - enableResponsesChatCompat"))
-}
-func (r *transformOptionsInputResolver) EnableResponsesChatCompat(ctx context.Context, obj *objects.TransformOptions, data *bool) error {
-	panic(fmt.Errorf("not implemented: EnableResponsesChatCompat - enableResponsesChatCompat"))
-}
-func (r *Resolver) TransformOptions() TransformOptionsResolver { return &transformOptionsResolver{r} }
-func (r *Resolver) TransformOptionsInput() TransformOptionsInputResolver {
-	return &transformOptionsInputResolver{r}
-}
-type transformOptionsResolver struct{ *Resolver }
-type transformOptionsInputResolver struct{ *Resolver }
-*/
