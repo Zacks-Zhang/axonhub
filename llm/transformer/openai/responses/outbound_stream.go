@@ -323,9 +323,10 @@ func (s *responsesOutboundStream) transformStreamChunk(event *httpclient.StreamE
 				ID:   item.CallID,
 				Type: llm.ToolTypeResponsesCustomTool,
 				ResponseCustomToolCall: &llm.ResponseCustomToolCall{
-					CallID: item.CallID,
-					Name:   item.Name,
-					Input:  "",
+					CallID:    item.CallID,
+					Name:      item.Name,
+					Namespace: item.Namespace,
+					Input:     "",
 				},
 			}
 			s.state.itemToCallID[item.ID] = item.CallID
@@ -341,8 +342,9 @@ func (s *responsesOutboundStream) transformStreamChunk(event *httpclient.StreamE
 								Type:  llm.ToolTypeResponsesCustomTool,
 								Index: toolCallIdx,
 								ResponseCustomToolCall: &llm.ResponseCustomToolCall{
-									CallID: item.CallID,
-									Name:   item.Name,
+									CallID:    item.CallID,
+									Name:      item.Name,
+									Namespace: item.Namespace,
 								},
 							},
 						},
@@ -594,9 +596,10 @@ func (s *responsesOutboundStream) transformStreamChunk(event *httpclient.StreamE
 									Index: toolCallIdx,
 									Type:  llm.ToolTypeResponsesCustomTool,
 									ResponseCustomToolCall: &llm.ResponseCustomToolCall{
-										CallID: callID,
-										Name:   tc.ResponseCustomToolCall.Name,
-										Input:  streamEvent.Delta,
+										CallID:    callID,
+										Name:      tc.ResponseCustomToolCall.Name,
+										Namespace: tc.ResponseCustomToolCall.Namespace,
+										Input:     streamEvent.Delta,
 									},
 								},
 							},

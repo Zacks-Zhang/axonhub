@@ -273,10 +273,11 @@ func convertAssistantMessage(msg llm.Message) []Item {
 			})
 		} else if tc.ResponseCustomToolCall != nil {
 			toolCallItems = append(toolCallItems, Item{
-				Type:   "custom_tool_call",
-				CallID: tc.ResponseCustomToolCall.CallID,
-				Name:   tc.ResponseCustomToolCall.Name,
-				Input:  lo.ToPtr(tc.ResponseCustomToolCall.Input),
+				Type:      "custom_tool_call",
+				CallID:    tc.ResponseCustomToolCall.CallID,
+				Name:      tc.ResponseCustomToolCall.Name,
+				Namespace: tc.ResponseCustomToolCall.Namespace,
+				Input:     lo.ToPtr(tc.ResponseCustomToolCall.Input),
 			})
 		} else {
 			toolCallItems = append(toolCallItems, Item{
@@ -892,9 +893,10 @@ func convertOutputToMessage(output []Item, transformerMetadata map[string]any) l
 				ID:   outputItem.CallID,
 				Type: llm.ToolTypeResponsesCustomTool,
 				ResponseCustomToolCall: &llm.ResponseCustomToolCall{
-					CallID: outputItem.CallID,
-					Name:   outputItem.Name,
-					Input:  inputStr,
+					CallID:    outputItem.CallID,
+					Name:      outputItem.Name,
+					Namespace: outputItem.Namespace,
+					Input:     inputStr,
 				},
 			})
 		case "tool_search_call":
