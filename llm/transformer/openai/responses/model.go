@@ -216,7 +216,7 @@ type ToolChoice struct {
 
 type ToolOption struct {
 	Type string `json:"type"`
-	Name string `json:"name"`
+	Name string `json:"name,omitempty"`
 }
 
 type ToolChoiceAlias ToolChoice
