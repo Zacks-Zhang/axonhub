@@ -170,7 +170,10 @@ var defaultEndpointsForChannelType = map[channel.Type][]objects.ChannelEndpoint{
 		{APIFormat: llm.APIFormatOpenAIResponse.String()},
 	},
 	channel.TypeXaiResponses:        {{APIFormat: llm.APIFormatOpenAIResponse.String()}},
-	channel.TypeXaiSubscription:     {{APIFormat: llm.APIFormatOpenAIResponse.String()}},
+	channel.TypeXaiSubscription: {
+		{APIFormat: llm.APIFormatOpenAIResponse.String()},
+		{APIFormat: llm.APIFormatOpenAIChatCompletion.String()},
+	},
 	channel.TypePpio:                openAICompatibleDefaultEndpoints,
 	channel.TypeSiliconflow:         openAICompatibleDefaultEndpoints,
 	channel.TypeVolcengine:          {{APIFormat: llm.APIFormatOpenAIChatCompletion.String()}},
@@ -277,7 +280,34 @@ func (c *Channel) ResolveEndpoints() []objects.ChannelEndpoint {
 		return nil
 	}
 
-	return mergeEndpoints(DefaultEndpointsForChannelType(c.Type), c.Endpoints)
+	return resolveChannelEndpoints(c.Type, c.Endpoints)
+}
+
+func resolveChannelEndpoints(typ channel.Type, userEndpoints []objects.ChannelEndpoint) []objects.ChannelEndpoint {
+	if typ == channel.TypeXaiSubscription && len(userEndpoints) > 0 {
+		if sanitized := sanitizeXAISubscriptionEndpoints(userEndpoints); len(sanitized) > 0 {
+			return sanitized
+		}
+	}
+
+	return mergeEndpoints(DefaultEndpointsForChannelType(typ), userEndpoints)
+}
+
+func sanitizeXAISubscriptionEndpoints(endpoints []objects.ChannelEndpoint) []objects.ChannelEndpoint {
+	allowed := map[string]struct{}{
+		llm.APIFormatOpenAIChatCompletion.String(): {},
+		llm.APIFormatOpenAIResponse.String():       {},
+	}
+
+	for _, ep := range endpoints {
+		if _, ok := allowed[ep.APIFormat]; !ok {
+			continue
+		}
+
+		return []objects.ChannelEndpoint{{APIFormat: ep.APIFormat}}
+	}
+
+	return nil
 }
 
 func (c *Channel) platformTypeForGeminiEndpoint() string {

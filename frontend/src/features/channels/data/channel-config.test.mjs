@@ -72,6 +72,7 @@ test('xAI subscription is exposed as an OAuth Responses channel', () => {
   const channelsConfig = read('features/channels/data/config_channels.ts');
   const providersConfig = read('features/channels/data/config_providers.ts');
   const channelColumns = read('features/channels/components/channels-columns.tsx');
+  const actionDialog = read('features/channels/components/channels-action-dialog.tsx');
 
   assert.match(schema, /channelTypeSchema[\s\S]*'xai_subscription'/);
   assert.equal((schema.match(/data\.type === 'xai_subscription'/g) ?? []).length, 1, 'create schema should validate xAI OAuth credentials');
@@ -87,9 +88,19 @@ test('xAI subscription is exposed as an OAuth Responses channel', () => {
   );
   assert.match(providersConfig, /xai_subscription:\s*{[\s\S]*channelTypes:\s*\[\s*'xai_subscription'\s*\]/);
   assert.match(
+    providersConfig,
+    /provider === 'xai_subscription' && !formats.includes\(OPENAI_CHAT_COMPLETIONS\)/,
+    'xAI subscription should expose chat completions as a selectable API format'
+  );
+  assert.match(
     channelColumns,
     /channel\.type !== 'xai_subscription'\s*&&\s*\([\s\S]*setOpen\('endpoints'\)/,
     'xAI subscription channels should not expose an endpoint editor that the server rejects'
+  );
+  assert.match(
+    actionDialog,
+    /dataWithModels\.endpoints = \[\{ apiFormat: selectedApiFormat \}\]/,
+    'xAI subscription create/edit should persist the selected API format as an exclusive endpoint'
   );
 });
 

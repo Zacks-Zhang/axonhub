@@ -531,7 +531,7 @@ func (svc *ChannelService) createChannel(ctx context.Context, input ent.CreateCh
 	if input.Type == channel.TypeXaiSubscription {
 		officialBaseURL := xaisubscription.DefaultBaseURL
 		input.BaseURL = &officialBaseURL
-		input.Endpoints = nil
+		input.Endpoints = sanitizeXAISubscriptionEndpoints(input.Endpoints)
 	}
 	if err := NormalizeAPIKeyAutoDisableRules(input.Policies); err != nil {
 		return nil, err
@@ -791,7 +791,10 @@ func (svc *ChannelService) UpdateChannel(ctx context.Context, id int, input *ent
 	officialBaseURL := xaisubscription.DefaultBaseURL
 	if input.Type != nil && *input.Type == channel.TypeXaiSubscription {
 		input.BaseURL = &officialBaseURL
-		input.Endpoints = []objects.ChannelEndpoint{}
+		input.Endpoints = sanitizeXAISubscriptionEndpoints(input.Endpoints)
+		if input.Endpoints == nil {
+			input.Endpoints = []objects.ChannelEndpoint{}
+		}
 	} else if input.Type == nil && (input.BaseURL != nil || input.Endpoints != nil) {
 		existing, err := svc.entFromContext(ctx).Channel.Query().Where(channel.IDEQ(id), channel.TypeEQ(channel.TypeXaiSubscription)).Exist(ctx)
 		if err != nil {
@@ -799,7 +802,9 @@ func (svc *ChannelService) UpdateChannel(ctx context.Context, id int, input *ent
 		}
 		if existing {
 			input.BaseURL = &officialBaseURL
-			input.Endpoints = []objects.ChannelEndpoint{}
+			if input.Endpoints != nil {
+				input.Endpoints = sanitizeXAISubscriptionEndpoints(input.Endpoints)
+			}
 		}
 	}
 

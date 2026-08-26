@@ -250,7 +250,7 @@ func TestChannelService_XAISubscriptionAlwaysUsesOfficialBaseURL(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.Equal(t, subscription.DefaultBaseURL, created.BaseURL)
-	require.Empty(t, created.Endpoints)
+	require.Equal(t, []objects.ChannelEndpoint{{APIFormat: "openai/responses"}}, created.Endpoints)
 	created = client.Channel.UpdateOneID(created.ID).
 		SetEndpoints([]objects.ChannelEndpoint{{APIFormat: "openai/responses", BaseURL: "https://attacker.example/legacy"}}).
 		SaveX(ctx)
@@ -261,7 +261,7 @@ func TestChannelService_XAISubscriptionAlwaysUsesOfficialBaseURL(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.Equal(t, subscription.DefaultBaseURL, updated.BaseURL)
-	require.Empty(t, updated.Endpoints)
+	require.Equal(t, []objects.ChannelEndpoint{{APIFormat: "openai/responses"}}, updated.Endpoints)
 
 	apiKeyChannel := client.Channel.Create().
 		SetType(channel.TypeXai).

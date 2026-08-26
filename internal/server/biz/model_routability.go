@@ -26,7 +26,7 @@ func hasCapableEndpointForModel(m *ent.Model, connections []*ModelChannelConnect
 			continue
 		}
 
-		endpoints := mergeEndpoints(DefaultEndpointsForChannelType(conn.Channel.Type), conn.Channel.Endpoints)
+		endpoints := resolveChannelEndpoints(conn.Channel.Type, conn.Channel.Endpoints)
 		for _, ep := range endpoints {
 			if _, ok := allowed[ep.APIFormat]; ok {
 				return true

@@ -186,6 +186,10 @@ func BuildOutboundByAPIFormat(ch *Channel, apiFormat string) (transformer.Outbou
 	return out, nil
 }
 
+func usesDistinctDefaultPeerOutbound(typ channel.Type) bool {
+	return typ == channel.TypeXai || typ == channel.TypeXaiSubscription
+}
+
 // buildChannelWithOutbounds builds a Channel with its outbound transformers
 // populated from the channel's resolved default endpoints.
 //
@@ -213,7 +217,7 @@ func (svc *ChannelService) buildChannelWithOutbounds(c *ent.Channel, apiKeyOverr
 			continue
 		}
 
-		if c.Type != channel.TypeXai || ep.APIFormat == ch.Outbound.APIFormat().String() {
+		if !usesDistinctDefaultPeerOutbound(c.Type) || ep.APIFormat == ch.Outbound.APIFormat().String() {
 			outbounds[ep.APIFormat] = ch.Outbound
 			continue
 		}
@@ -276,6 +280,47 @@ func primaryEndpointTransport(c *ent.Channel, apiFormat string) string {
 	}
 
 	return endpointTransport(objects.ChannelEndpoint{BaseURL: c.BaseURL})
+}
+
+func (svc *ChannelService) buildXAISubscriptionResponsesOutbound(ch *Channel) (transformer.Outbound, error) {
+	if existing, ok := ch.Outbound.(*xaisubscription.OutboundTransformer); ok {
+		return existing, nil
+	}
+
+	tokens := xAISubscriptionTokenProvider(ch)
+	if tokens == nil {
+		return nil, errors.New("xAI subscription responses outbound is not available")
+	}
+
+	return xaisubscription.NewOutboundTransformer(tokens)
+}
+
+func (svc *ChannelService) buildXAISubscriptionChatOutbound(ch *Channel) (transformer.Outbound, error) {
+	if existing, ok := ch.Outbound.(*xaisubscription.ChatOutboundTransformer); ok {
+		return existing, nil
+	}
+
+	tokens := xAISubscriptionTokenProvider(ch)
+	if tokens == nil {
+		return nil, errors.New("xAI subscription chat outbound is not available")
+	}
+
+	return xaisubscription.NewChatOutboundTransformer(tokens)
+}
+
+func xAISubscriptionTokenProvider(ch *Channel) oauth.TokenGetter {
+	if ch == nil || ch.Outbound == nil {
+		return nil
+	}
+
+	switch outbound := ch.Outbound.(type) {
+	case *xaisubscription.OutboundTransformer:
+		return outbound.TokenProvider()
+	case *xaisubscription.ChatOutboundTransformer:
+		return outbound.TokenProvider()
+	default:
+		return nil
+	}
 }
 
 func (svc *ChannelService) buildCodexOutbound(
@@ -379,6 +424,10 @@ func (svc *ChannelService) buildNonDefaultEndpointOutbound(
 			})
 		}
 
+		if c.Type == channel.TypeXaiSubscription {
+			return svc.buildXAISubscriptionChatOutbound(ch)
+		}
+
 		return openai.NewOutboundTransformerWithConfig(&openai.Config{
 			PlatformType:   openai.PlatformOpenAI,
 			BaseURL:        baseURL,
@@ -396,6 +445,10 @@ func (svc *ChannelService) buildNonDefaultEndpointOutbound(
 		transport := endpointTransport(ep)
 		if (c.Type == channel.TypeCodex || c.Type == channel.TypeFenno) && ep.APIFormat == llm.APIFormatOpenAIResponse.String() {
 			return svc.buildCodexOutbound(c, ch, baseURL, transport, ch.HTTPClient)
+		}
+
+		if c.Type == channel.TypeXaiSubscription {
+			return svc.buildXAISubscriptionResponsesOutbound(ch)
 		}
 
 		return responses.NewOutboundTransformerWithConfig(&responses.Config{

@@ -120,9 +120,12 @@ func TestDefaultEndpointsForChannelType_UseLLMAPIFormatValues(t *testing.T) {
 			expected: []string{llm.APIFormatOpenAIResponse.String()},
 		},
 		{
-			name:     "xai subscription defaults to responses",
+			name:     "xai subscription exposes responses and chat",
 			typ:      channel.TypeXaiSubscription,
-			expected: []string{llm.APIFormatOpenAIResponse.String()},
+			expected: []string{
+				llm.APIFormatOpenAIResponse.String(),
+				llm.APIFormatOpenAIChatCompletion.String(),
+			},
 		},
 		{
 			name: "codex exposes responses plus image generation and edit",
@@ -312,6 +315,19 @@ func TestResolveEndpoints_MergesDefaultsAndUserOverrides(t *testing.T) {
 		{APIFormat: llm.APIFormatOpenAITranslation.String()},
 		{APIFormat: llm.APIFormatGeminiContents.String(), Path: "/v1/gemini"},
 	}, endpoints)
+}
+
+func TestResolveEndpoints_XAISubscriptionExclusiveChatOverride(t *testing.T) {
+	ch := &Channel{
+		Channel: &ent.Channel{
+			Type: channel.TypeXaiSubscription,
+			Endpoints: []objects.ChannelEndpoint{
+				{APIFormat: llm.APIFormatOpenAIChatCompletion.String(), BaseURL: "https://attacker.example/v1"},
+			},
+		},
+	}
+
+	require.Equal(t, []objects.ChannelEndpoint{{APIFormat: llm.APIFormatOpenAIChatCompletion.String()}}, ch.ResolveEndpoints())
 }
 
 func TestSupportedAPIFormats_UsesLLMAPIFormatValues(t *testing.T) {

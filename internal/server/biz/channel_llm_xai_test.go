@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/samber/lo"
 	"github.com/stretchr/testify/require"
 
 	"github.com/looplj/axonhub/internal/authz"
@@ -147,6 +148,71 @@ func TestXaiSubscriptionChannel_BuildsOfficialResponsesOutbound(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, subscription.DefaultBaseURL+"/responses", request.URL)
 	require.Equal(t, "synthetic-token", request.Auth.APIKey)
+}
+
+func TestXaiSubscriptionChannel_BuildsOfficialChatPeerOutbound(t *testing.T) {
+	client := enttest.NewEntClient(t, "sqlite3", "file:ent?mode=memory&_fk=0")
+	t.Cleanup(func() { _ = client.Close() })
+	ctx := authz.WithTestBypass(context.Background())
+	entity := client.Channel.Create().
+		SetName("xAI subscription chat peer").
+		SetType(channel.TypeXaiSubscription).
+		SetBaseURL("https://attacker.example/v1").
+		SetCredentials(objects.ChannelCredentials{OAuth: &objects.OAuthCredentials{
+			AccessToken:  "synthetic-token",
+			RefreshToken: "synthetic-refresh",
+			ClientID:     subscription.ClientID,
+			ExpiresAt:    time.Now().Add(time.Hour),
+		}}).
+		SetSupportedModels([]string{"grok-4.5"}).
+		SetDefaultTestModel("grok-4.5").
+		SaveX(ctx)
+
+	built, err := NewChannelServiceForTest(client).buildChannelWithOutbounds(entity)
+	require.NoError(t, err)
+
+	peer, err := BuildOutboundByAPIFormat(built, llm.APIFormatOpenAIChatCompletion.String())
+	require.NoError(t, err)
+	require.IsType(t, &subscription.ChatOutboundTransformer{}, peer)
+	require.NotSame(t, built.Outbound, peer)
+
+	request, err := peer.TransformRequest(ctx, &llm.Request{
+		Model: "grok-4.5",
+		Messages: []llm.Message{
+			{Role: "user", Content: llm.MessageContent{Content: lo.ToPtr("hello")}},
+		},
+	})
+	require.NoError(t, err)
+	require.Equal(t, subscription.DefaultBaseURL+"/chat/completions", request.URL)
+	require.Equal(t, "synthetic-token", request.Auth.APIKey)
+}
+
+func TestXaiSubscriptionChannel_ExclusiveChatEndpointSelectsChat(t *testing.T) {
+	client := enttest.NewEntClient(t, "sqlite3", "file:ent?mode=memory&_fk=0")
+	t.Cleanup(func() { _ = client.Close() })
+	ctx := authz.WithTestBypass(context.Background())
+	entity := client.Channel.Create().
+		SetName("xAI subscription chat only").
+		SetType(channel.TypeXaiSubscription).
+		SetBaseURL(subscription.DefaultBaseURL).
+		SetCredentials(objects.ChannelCredentials{OAuth: &objects.OAuthCredentials{
+			AccessToken:  "synthetic-token",
+			RefreshToken: "synthetic-refresh",
+			ClientID:     subscription.ClientID,
+			ExpiresAt:    time.Now().Add(time.Hour),
+		}}).
+		SetSupportedModels([]string{"grok-4.5"}).
+		SetDefaultTestModel("grok-4.5").
+		SetEndpoints([]objects.ChannelEndpoint{{APIFormat: llm.APIFormatOpenAIChatCompletion.String()}}).
+		SaveX(ctx)
+
+	built, err := NewChannelServiceForTest(client).buildChannelWithOutbounds(entity)
+	require.NoError(t, err)
+	require.Equal(t, []objects.ChannelEndpoint{{APIFormat: llm.APIFormatOpenAIChatCompletion.String()}}, built.ResolveEndpoints())
+
+	selected, err := BuildOutboundByAPIFormat(built, llm.APIFormatOpenAIChatCompletion.String())
+	require.NoError(t, err)
+	require.IsType(t, &subscription.ChatOutboundTransformer{}, selected)
 }
 
 func TestXaiSubscriptionChannel_EmptyOAuthObjectFallsBackToLegacyJSON(t *testing.T) {

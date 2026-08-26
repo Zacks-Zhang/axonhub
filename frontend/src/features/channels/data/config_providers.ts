@@ -37,7 +37,7 @@ import { AtlasCloudIcon } from '../components/atlas-cloud-icon';
 import { EvolinkIcon } from '../components/evolink-icon';
 import { FennoIcon } from '../components/fenno-icon';
 import { NanoGPTIcon } from '../components/nanogpt-icon';
-import { CHANNEL_CONFIGS } from './config_channels';
+import { CHANNEL_CONFIGS, OPENAI_CHAT_COMPLETIONS, OPENAI_RESPONSES } from './config_channels';
 import { ApiFormat, ChannelType } from './schema';
 
 export interface ProviderConfig {
@@ -314,6 +314,10 @@ export const getChannelTypeForApiFormat = (provider: string, apiFormat: ApiForma
   const providerConfig = PROVIDER_CONFIGS[provider];
   if (!providerConfig) return undefined;
 
+  if (provider === 'xai_subscription' && (apiFormat === OPENAI_RESPONSES || apiFormat === OPENAI_CHAT_COMPLETIONS)) {
+    return 'xai_subscription';
+  }
+
   for (const channelType of providerConfig.channelTypes) {
     const channelConfig = CHANNEL_CONFIGS[channelType];
     if (channelConfig?.apiFormat === apiFormat) {
@@ -336,6 +340,9 @@ export const getApiFormatsForProvider = (provider: string): ApiFormat[] => {
     if (channelConfig?.apiFormat && !formats.includes(channelConfig.apiFormat)) {
       formats.push(channelConfig.apiFormat);
     }
+  }
+  if (provider === 'xai_subscription' && !formats.includes(OPENAI_CHAT_COMPLETIONS)) {
+    formats.push(OPENAI_CHAT_COMPLETIONS);
   }
   return formats;
 };

@@ -19,6 +19,22 @@ type OutboundTransformer struct {
 	responses *responses.OutboundTransformer
 }
 
+func applyCLIAuth(httpRequest *httpclient.Request, accessToken string) {
+	if httpRequest == nil {
+		return
+	}
+
+	httpRequest.Auth = &httpclient.AuthConfig{Type: httpclient.AuthTypeBearer, APIKey: accessToken}
+	httpRequest.Headers.Set(CLITokenAuthHeader, CLITokenAuth)
+	httpRequest.Headers.Set(CLIClientVersionHeader, CLIClientVersion)
+	httpRequest.Headers.Set(CLIClientIdentifierHeader, CLIClientIdentifier)
+	httpRequest.Headers.Set("User-Agent", CLIUserAgent)
+}
+
+func (t *OutboundTransformer) TokenProvider() oauth.TokenGetter {
+	return t.tokens
+}
+
 func NewOutboundTransformer(tokenProvider oauth.TokenGetter) (*OutboundTransformer, error) {
 	if tokenProvider == nil {
 		return nil, errors.New("token provider is required")
@@ -41,7 +57,7 @@ func (t *OutboundTransformer) APIFormat() llm.APIFormat {
 
 func (t *OutboundTransformer) TransformRequest(ctx context.Context, request *llm.Request) (*httpclient.Request, error) {
 	if request != nil {
-		//nolint:exhaustive // The subscription proxy only exposes text Responses.
+		//nolint:exhaustive // The subscription proxy only exposes text chat and Responses.
 		switch request.RequestType {
 		case llm.RequestTypeChat, "":
 		default:
@@ -59,11 +75,7 @@ func (t *OutboundTransformer) TransformRequest(ctx context.Context, request *llm
 		return nil, err
 	}
 
-	httpRequest.Auth = &httpclient.AuthConfig{Type: httpclient.AuthTypeBearer, APIKey: credentials.AccessToken}
-	httpRequest.Headers.Set(CLITokenAuthHeader, CLITokenAuth)
-	httpRequest.Headers.Set(CLIClientVersionHeader, CLIClientVersion)
-	httpRequest.Headers.Set(CLIClientIdentifierHeader, CLIClientIdentifier)
-	httpRequest.Headers.Set("User-Agent", CLIUserAgent)
+	applyCLIAuth(httpRequest, credentials.AccessToken)
 
 	return httpRequest, nil
 }

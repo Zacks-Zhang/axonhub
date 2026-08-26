@@ -173,6 +173,16 @@ function getResponsesTransportFromChannel(channel?: Pick<Channel, 'baseURL' | 'e
   return getResponsesTransportFromBaseURL(channel?.baseURL);
 }
 
+function getXAISubscriptionApiFormat(channel?: Pick<Channel, 'type' | 'endpoints'>): ApiFormat {
+  const selected = channel?.endpoints?.find(
+    (endpoint) => endpoint.apiFormat === OPENAI_CHAT_COMPLETIONS || endpoint.apiFormat === OPENAI_RESPONSES
+  )?.apiFormat;
+  if (selected === OPENAI_CHAT_COMPLETIONS || selected === OPENAI_RESPONSES) {
+    return selected;
+  }
+  return OPENAI_RESPONSES;
+}
+
 function getResponsesWebSocketBaseURL(channelType: ChannelType): string | undefined {
   if (channelType === 'codex') return CODEX_RESPONSES_WEBSOCKET_BASE_URL;
   if (channelType === 'openai_responses') return OPENAI_RESPONSES_WEBSOCKET_BASE_URL;
@@ -466,6 +476,9 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
   });
   const [selectedApiFormat, setSelectedApiFormat] = useState<ApiFormat>(() => {
     if (initialRow) {
+      if (initialRow.type === 'xai_subscription') {
+        return getXAISubscriptionApiFormat(initialRow);
+      }
       return CHANNEL_CONFIGS[initialRow.type as ChannelType]?.apiFormat || 'openai/chat_completions';
     }
     return 'openai/chat_completions';
@@ -495,7 +508,10 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
 
     const provider = getProviderFromChannelType(initialRow.type) || 'openai';
     setSelectedProvider(provider);
-    const apiFormat = CHANNEL_CONFIGS[initialRow.type as ChannelType]?.apiFormat || OPENAI_CHAT_COMPLETIONS;
+    const apiFormat =
+      initialRow.type === 'xai_subscription'
+        ? getXAISubscriptionApiFormat(initialRow)
+        : CHANNEL_CONFIGS[initialRow.type as ChannelType]?.apiFormat || OPENAI_CHAT_COMPLETIONS;
     setSelectedApiFormat(apiFormat);
     setResponsesTransport(getResponsesTransportFromChannel(initialRow));
     setUseGeminiVertex(initialRow.type === 'gemini_vertex');
@@ -928,7 +944,7 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
 
   const handleApiFormatChange = useCallback(
     (formatOption: ApiFormatOption) => {
-      if (isOAuthChannel) return;
+      if (isOAuthChannel && selectedProvider !== 'xai_subscription') return;
       if (selectedProvider === 'codex' || selectedProvider === 'antigravity') return;
 
       const format = formatOption === OPENAI_RESPONSES_WEBSOCKET ? OPENAI_RESPONSES : formatOption;
@@ -1271,6 +1287,10 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
         if (baseURL) {
           dataWithModels.baseURL = baseURL;
         }
+      }
+
+      if (isXAISubscriptionType) {
+        dataWithModels.endpoints = [{ apiFormat: selectedApiFormat }];
       }
 
       if (selectedApiFormat === OPENAI_RESPONSES && !baseURLMatchesResponsesTransport(dataWithModels.baseURL, responsesTransport)) {
@@ -1764,7 +1784,11 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
             // Reset provider and API format state
             if (initialRow) {
               setSelectedProvider(getProviderFromChannelType(initialRow.type) || 'openai');
-              setSelectedApiFormat(CHANNEL_CONFIGS[initialRow.type as ChannelType]?.apiFormat || OPENAI_CHAT_COMPLETIONS);
+              setSelectedApiFormat(
+                initialRow.type === 'xai_subscription'
+                  ? getXAISubscriptionApiFormat(initialRow)
+                  : CHANNEL_CONFIGS[initialRow.type as ChannelType]?.apiFormat || OPENAI_CHAT_COMPLETIONS
+              );
               setResponsesTransport(getResponsesTransportFromChannel(initialRow));
               setUseGeminiVertex(initialRow.type === 'gemini_vertex');
               setUseAnthropicAws(initialRow.type === 'anthropic_aws');
@@ -1863,7 +1887,7 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
                               key={selectedProvider}
                               defaultValue={selectedApiFormatOption}
                               onValueChange={(value) => handleApiFormatChange(value as ApiFormatOption)}
-                              disabled={!!isOAuthChannel}
+                              disabled={!!isOAuthChannel && selectedProvider !== 'xai_subscription'}
                               placeholder={t('channels.dialogs.fields.apiFormat.placeholder')}
                               data-testid='api-format-select'
                               isControlled={true}
