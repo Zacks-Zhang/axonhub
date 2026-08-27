@@ -3,6 +3,7 @@ package subscription
 import (
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"strings"
 
 	"github.com/looplj/axonhub/llm"
@@ -98,17 +99,154 @@ func inlineRootUnionRefBranches(schema map[string]any) error {
 			continue
 		}
 
-		for i, branch := range branches {
-			inlined, err := inlineLocalRefs(branch, definitions, nil)
+		inlined := make([]any, 0, len(branches))
+		for _, branch := range branches {
+			resolved, err := inlineLocalRefs(branch, definitions, nil)
 			if err != nil {
 				return err
 			}
 
-			branches[i] = inlined
+			inlined = append(inlined, resolved)
 		}
+
+		normalized, ok := flattenSoleUnionBranches(inlined, unionKey)
+		if !ok {
+			normalized = inlined
+		}
+		schema[unionKey] = normalized
 	}
 
 	return nil
+}
+
+func flattenSoleUnionBranches(branches []any, unionKey string) ([]any, bool) {
+	normalized := make([]any, 0, len(branches))
+	changed := false
+
+	for _, branch := range branches {
+		nested, ok := soleUnionBranches(branch, unionKey)
+		if !ok {
+			normalized = append(normalized, branch)
+			continue
+		}
+
+		normalized = append(normalized, nested...)
+		changed = true
+	}
+
+	if !changed {
+		return branches, false
+	}
+	if unionKey == "oneOf" && !branchesAreMutuallyExclusive(normalized) {
+		return nil, false
+	}
+
+	return normalized, true
+}
+
+func soleUnionBranches(value any, unionKey string) ([]any, bool) {
+	schema, ok := value.(map[string]any)
+	if !ok || len(schema) != 1 {
+		return nil, false
+	}
+
+	branches, ok := schema[unionKey].([]any)
+	if !ok || len(branches) == 0 {
+		return nil, false
+	}
+
+	return branches, true
+}
+
+func branchesAreMutuallyExclusive(branches []any) bool {
+	for i := 0; i < len(branches); i++ {
+		left, ok := branches[i].(map[string]any)
+		if !ok {
+			return false
+		}
+
+		for j := i + 1; j < len(branches); j++ {
+			right, ok := branches[j].(map[string]any)
+			if !ok {
+				return false
+			}
+			if !branchesAreDisjoint(left, right) {
+				return false
+			}
+		}
+	}
+
+	return true
+}
+
+func branchesAreDisjoint(left, right map[string]any) bool {
+	leftProperties, _ := left["properties"].(map[string]any)
+	rightProperties, _ := right["properties"].(map[string]any)
+	rightRequired := requiredProperties(right)
+
+	for required := range requiredProperties(left) {
+		if _, ok := rightRequired[required]; !ok {
+			continue
+		}
+
+		leftValues, ok := enumValues(leftProperties[required])
+		if !ok {
+			continue
+		}
+		rightValues, ok := enumValues(rightProperties[required])
+		if !ok {
+			continue
+		}
+		if valuesAreDisjoint(leftValues, rightValues) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func requiredProperties(schema map[string]any) map[string]struct{} {
+	required := make(map[string]struct{})
+	values, ok := schema["required"].([]any)
+	if !ok {
+		return required
+	}
+
+	for _, value := range values {
+		if name, ok := value.(string); ok {
+			required[name] = struct{}{}
+		}
+	}
+
+	return required
+}
+
+func enumValues(schema any) ([]any, bool) {
+	properties, ok := schema.(map[string]any)
+	if !ok {
+		return nil, false
+	}
+
+	if values, ok := properties["enum"].([]any); ok {
+		return values, true
+	}
+	if value, ok := properties["const"]; ok {
+		return []any{value}, true
+	}
+
+	return nil, false
+}
+
+func valuesAreDisjoint(left, right []any) bool {
+	for _, leftValue := range left {
+		for _, rightValue := range right {
+			if reflect.DeepEqual(leftValue, rightValue) {
+				return false
+			}
+		}
+	}
+
+	return true
 }
 
 func inlineLocalRefs(value any, definitions map[string]any, active map[string]struct{}) (any, error) {

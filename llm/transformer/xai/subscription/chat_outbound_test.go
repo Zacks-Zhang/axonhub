@@ -136,6 +136,191 @@ func TestChatOutboundTransformer_TransformRequest_inlinesRootUnionRefs(t *testin
 	require.Equal(t, expected, function["parameters"])
 }
 
+func TestChatOutboundTransformer_TransformRequest_flattensNestedRootUnionRefs(t *testing.T) {
+	outbound, err := NewChatOutboundTransformer(oauth.NewStaticTokenProvider(&oauth.OAuthCredentials{AccessToken: "synthetic-token"}))
+	require.NoError(t, err)
+
+	request := &llm.Request{
+		APIFormat: llm.APIFormatOpenAIResponse,
+		Model:     "grok-4.6",
+		Messages: []llm.Message{
+			{Role: "user", Content: llm.MessageContent{Content: lo.ToPtr("hello")}},
+		},
+		Tools: []llm.Tool{{
+			Type: llm.ToolTypeFunction,
+			Function: llm.Function{
+				Name: "diag_tool",
+				Parameters: json.RawMessage(`{
+					"type": "object",
+					"oneOf": [
+						{"$ref": "#/$defs/view"},
+						{"$ref": "#/$defs/create"}
+					],
+					"$defs": {
+						"view": {
+							"type": "object",
+							"properties": {
+								"id": {"type": "string"},
+								"mode": {"enum": ["view"]}
+							},
+							"required": ["id", "mode"],
+							"additionalProperties": false
+						},
+						"create": {
+							"oneOf": [
+								{
+									"type": "object",
+									"properties": {
+										"kind": {"enum": ["cron"]},
+										"mode": {"enum": ["create"]}
+									},
+									"required": ["kind", "mode"],
+									"additionalProperties": false
+								},
+								{
+									"type": "object",
+									"properties": {
+										"kind": {"enum": ["heartbeat"]},
+										"mode": {"enum": ["create"]}
+									},
+									"required": ["kind", "mode"],
+									"additionalProperties": false
+								}
+							]
+						}
+					}
+				}`),
+			},
+		}},
+	}
+
+	originalParameters := string(request.Tools[0].Function.Parameters)
+
+	httpRequest, err := outbound.TransformRequest(context.Background(), request)
+	require.NoError(t, err)
+	require.Equal(t, originalParameters, string(request.Tools[0].Function.Parameters))
+
+	var body struct {
+		Tools []struct {
+			Function struct {
+				Parameters map[string]any `json:"parameters"`
+			} `json:"function"`
+		} `json:"tools"`
+	}
+	require.NoError(t, json.Unmarshal(httpRequest.Body, &body))
+	require.Len(t, body.Tools, 1)
+
+	branches, ok := body.Tools[0].Function.Parameters["oneOf"].([]any)
+	require.True(t, ok)
+	require.Len(t, branches, 3)
+
+	modes := make([]string, 0, 3)
+	for _, branch := range branches {
+		branchSchema, ok := branch.(map[string]any)
+		require.True(t, ok)
+		require.Equal(t, "object", branchSchema["type"])
+
+		properties, ok := branchSchema["properties"].(map[string]any)
+		require.True(t, ok)
+		mode, ok := properties["mode"].(map[string]any)
+		require.True(t, ok)
+		values, ok := mode["enum"].([]any)
+		require.True(t, ok)
+		require.Len(t, values, 1)
+		modes = append(modes, values[0].(string))
+	}
+	require.Equal(t, []string{"view", "create", "create"}, modes)
+}
+
+func TestChatOutboundTransformer_DoesNotFlattenSemanticNestedUnions(t *testing.T) {
+	for name, tc := range map[string]struct {
+		parameters json.RawMessage
+		nestedKey  string
+	}{
+		"sibling": {
+			parameters: json.RawMessage(`{"type":"object","oneOf":[{"$ref":"#/$defs/value"}],"$defs":{"value":{"oneOf":[{"type":"string"}],"description":"nested"}}}`),
+			nestedKey:  "oneOf",
+		},
+		"mixed": {
+			parameters: json.RawMessage(`{"type":"object","oneOf":[{"$ref":"#/$defs/value"}],"$defs":{"value":{"anyOf":[{"type":"string"},{"type":"number"}]}}}`),
+			nestedKey:  "anyOf",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			normalized, err := normalizeChatFunctionParameters(tc.parameters)
+			require.NoError(t, err)
+
+			var schema map[string]any
+			require.NoError(t, json.Unmarshal(normalized, &schema))
+			branches, ok := schema["oneOf"].([]any)
+			require.True(t, ok)
+			require.Len(t, branches, 1)
+
+			branch, ok := branches[0].(map[string]any)
+			require.True(t, ok)
+			require.Contains(t, branch, tc.nestedKey)
+			if name == "sibling" {
+				require.Equal(t, "nested", branch["description"])
+			} else {
+				require.Len(t, branch, 1)
+			}
+		})
+	}
+}
+
+func TestChatOutboundTransformer_DoesNotFlattenOverlappingNestedOneOf(t *testing.T) {
+	parameters := json.RawMessage(`{
+		"type": "object",
+		"oneOf": [
+			{"$ref": "#/$defs/view"},
+			{"$ref": "#/$defs/create"}
+		],
+		"$defs": {
+			"view": {
+				"type": "object",
+				"properties": {"mode": {"enum": ["view"]}},
+				"required": ["mode"],
+				"additionalProperties": false
+			},
+			"create": {
+				"oneOf": [
+					{
+						"type": "object",
+						"properties": {
+							"kind": {"enum": ["cron"]},
+							"mode": {"enum": ["create"]}
+						},
+						"required": ["kind", "mode"],
+						"additionalProperties": false
+					},
+					{
+						"type": "object",
+						"properties": {
+							"kind": {"enum": ["cron"]},
+							"mode": {"enum": ["create"]}
+						},
+						"required": ["kind", "mode"],
+						"additionalProperties": false
+					}
+				]
+			}
+		}
+	}`)
+
+	normalized, err := normalizeChatFunctionParameters(parameters)
+	require.NoError(t, err)
+
+	var schema map[string]any
+	require.NoError(t, json.Unmarshal(normalized, &schema))
+	branches, ok := schema["oneOf"].([]any)
+	require.True(t, ok)
+	require.Len(t, branches, 2)
+
+	nested, ok := branches[1].(map[string]any)
+	require.True(t, ok)
+	require.Contains(t, nested, "oneOf")
+}
+
 func TestChatOutboundTransformer_TransformRequest_rejectsMissingUnionRef(t *testing.T) {
 	outbound, err := NewChatOutboundTransformer(oauth.NewStaticTokenProvider(&oauth.OAuthCredentials{AccessToken: "synthetic-token"}))
 	require.NoError(t, err)
