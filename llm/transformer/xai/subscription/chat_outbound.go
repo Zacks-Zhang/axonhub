@@ -62,6 +62,11 @@ func (t *ChatOutboundTransformer) TransformRequest(ctx context.Context, request 
 		}
 	}
 
+	request, err := normalizeChatRequestToolSchemas(request)
+	if err != nil {
+		return nil, err
+	}
+
 	credentials, err := t.tokens.Get(ctx)
 	if err != nil {
 		return nil, err
