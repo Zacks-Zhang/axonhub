@@ -621,6 +621,7 @@ func mergeToolOutputItems(items []Item, startIdx int) ([]*llm.Message, int, erro
 
 	order := make([]string, 0)
 	byCallID := make(map[string]*toolOutputAccumulator)
+	orphanMessages := make([]*llm.Message, 0)
 	consumed := 0
 	for idx := startIdx; idx < len(items); idx++ {
 		it := &items[idx]
@@ -633,6 +634,13 @@ func mergeToolOutputItems(items []Item, startIdx int) ([]*llm.Message, int, erro
 		}
 		consumed++
 		if outMsg != nil {
+			if it.CallID == "" {
+				orphanMessages = append(orphanMessages, &llm.Message{
+					Role:    "user",
+					Content: outMsg.Content,
+				})
+				continue
+			}
 			acc, ok := byCallID[it.CallID]
 			if !ok {
 				acc = &toolOutputAccumulator{}
@@ -654,6 +662,7 @@ func mergeToolOutputItems(items []Item, startIdx int) ([]*llm.Message, int, erro
 		acc := byCallID[callID]
 		messages = append(messages, toolOutputMessage(callID, acc.toolName, acc.parts))
 	}
+	messages = append(messages, orphanMessages...)
 	return messages, consumed, nil
 }
 

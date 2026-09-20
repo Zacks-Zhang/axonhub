@@ -1160,6 +1160,61 @@ func TestInboundTransformer_TransformRequest_MergesRepeatedFunctionOutputs(t *te
 	require.Contains(t, merged, "second")
 }
 
+func TestInboundTransformer_TransformRequest_ConvertsOrphanFunctionOutputToUser(t *testing.T) {
+	trans := NewInboundTransformer()
+
+	result, err := trans.TransformRequest(context.Background(), &httpclient.Request{
+		Body: []byte(`{
+			"model": "gpt-4o",
+			"input": [
+				{
+					"type": "function_call_output",
+					"name": "create_thread",
+					"output": "<codex_delegation>task payload</codex_delegation>"
+				}
+			]
+		}`),
+	})
+
+	require.NoError(t, err)
+	require.Len(t, result.Messages, 1)
+	require.Equal(t, "user", result.Messages[0].Role)
+	require.Equal(t, "<codex_delegation>task payload</codex_delegation>", flattenToolContent(t, result.Messages[0].Content))
+	require.Nil(t, result.Messages[0].ToolCallID)
+	for _, message := range result.Messages {
+		require.NotEqual(t, "tool", message.Role)
+	}
+}
+
+func TestInboundTransformer_TransformRequest_KeepsToolBeforeOrphanFunctionOutput(t *testing.T) {
+	trans := NewInboundTransformer()
+
+	result, err := trans.TransformRequest(context.Background(), &httpclient.Request{
+		Body: []byte(`{
+			"model": "gpt-4o",
+			"input": [
+				{"role": "user", "content": "run fn"},
+				{"type": "function_call", "call_id": "call_x", "name": "fn", "arguments": "{}"},
+				{"type": "function_call_output", "call_id": "call_x", "output": "result"},
+				{
+					"type": "function_call_output",
+					"name": "create_thread",
+					"output": "<codex_delegation>task payload</codex_delegation>"
+				}
+			]
+		}`),
+	})
+
+	require.NoError(t, err)
+	require.Len(t, result.Messages, 4)
+	require.Equal(t, "tool", result.Messages[2].Role)
+	require.Equal(t, "call_x", lo.FromPtr(result.Messages[2].ToolCallID))
+	require.Equal(t, "result", flattenToolContent(t, result.Messages[2].Content))
+	require.Equal(t, "user", result.Messages[3].Role)
+	require.Equal(t, "<codex_delegation>task payload</codex_delegation>", flattenToolContent(t, result.Messages[3].Content))
+	require.Nil(t, result.Messages[3].ToolCallID)
+}
+
 func flattenToolContent(t *testing.T, c llm.MessageContent) string {
 	t.Helper()
 	if len(c.MultipleContent) == 0 && c.Content != nil {
