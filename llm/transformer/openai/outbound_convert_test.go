@@ -1,7 +1,6 @@
 package openai
 
 import (
-	"context"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -72,14 +71,21 @@ func TestRequestFromLLM(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := RequestFromLLM(context.Background(), tt.llmReq, ReasoningFieldNone)
+			result := requireRequestFromLLM(t, tt.llmReq, ReasoningFieldNone)
 			tt.validate(t, result)
 		})
 	}
 }
 
+func requireRequestFromLLM(t *testing.T, request *llm.Request, reasoningField ReasoningField) *Request {
+	t.Helper()
+	result, err := RequestFromLLM(request, reasoningField)
+	require.NoError(t, err)
+	return result
+}
+
 func TestRequestFromLLM_FiltersResponsesOnlyToolsWithoutLifecycleMetadata(t *testing.T) {
-	req := RequestFromLLM(context.Background(), &llm.Request{
+	req := requireRequestFromLLM(t, &llm.Request{
 		Model:    "gpt-4o",
 		Messages: []llm.Message{{Role: "user", Content: llm.MessageContent{Content: lo.ToPtr("hi")}}},
 		Tools: []llm.Tool{
@@ -115,7 +121,7 @@ func TestRequestFromLLM_FiltersResponsesOnlyToolsWithoutLifecycleMetadata(t *tes
 }
 
 func TestRequestFromLLM_ReindexesAssistantToolCallsByArrayPosition(t *testing.T) {
-	req := RequestFromLLM(context.Background(), &llm.Request{Messages: []llm.Message{{
+	req := requireRequestFromLLM(t, &llm.Request{Messages: []llm.Message{{
 		Role: "assistant",
 		ToolCalls: []llm.ToolCall{
 			{Index: 0, ID: "call_a", Type: "function", Function: llm.FunctionCall{Name: "first", Arguments: `{}`}},
@@ -540,6 +546,24 @@ func TestResponsesChatToolStreamRestorer_IsolatesChoices(t *testing.T) {
 	require.Equal(t, "call_lookup_0", calls[1].ID)
 	require.Equal(t, "lookup", calls[1].Function.Name)
 	require.Nil(t, calls[1].ResponseCustomToolCall)
+
+	partialChoiceZero := &llm.Response{Choices: []llm.Choice{{Index: 0, Delta: &llm.Message{ToolCalls: []llm.ToolCall{{
+		ID: "call_patch_again", Index: 3, Function: llm.FunctionCall{Name: "apply_"},
+	}}}}}}
+	blockedChoiceZero := &llm.Response{Choices: []llm.Choice{{Index: 0, Delta: &llm.Message{ToolCalls: []llm.ToolCall{{
+		ID: "call_lookup_again", Index: 4, Function: llm.FunctionCall{Name: "lookup", Arguments: `{}`},
+	}}}}}}
+	abnormalChoiceOne := &llm.Response{Choices: []llm.Choice{{
+		Index: 1, FinishReason: lo.ToPtr("length"),
+	}}}
+
+	restorer.restore(partialChoiceZero)
+	restorer.restore(blockedChoiceZero)
+	require.Empty(t, partialChoiceZero.Choices[0].Delta.ToolCalls)
+	require.Empty(t, blockedChoiceZero.Choices[0].Delta.ToolCalls)
+
+	restorer.restore(abnormalChoiceOne)
+	require.Nil(t, abnormalChoiceOne.Choices[0].Delta)
 }
 
 func TestResponsesChatToolStreamRestorer_DuplicateIndexSeeds(t *testing.T) {
@@ -1135,7 +1159,7 @@ func TestResponsesChatToolAdapter_AllowedToolsDoesNotBreakHistoryMappings(t *tes
 		},
 	}
 
-	chatRequest, _, err := requestFromLLMWithResponsesToolAdapter(request, ReasoningFieldNone)
+	chatRequest, adapter, err := requestFromLLMWithResponsesToolAdapter(request, ReasoningFieldNone)
 	require.NoError(t, err)
 	require.Len(t, chatRequest.Tools, 1)
 	require.Equal(t, "lookup", chatRequest.Tools[0].Function.Name)
@@ -1143,6 +1167,7 @@ func TestResponsesChatToolAdapter_AllowedToolsDoesNotBreakHistoryMappings(t *tes
 	require.Len(t, chatRequest.Messages[0].ToolCalls, 1)
 	require.Equal(t, "apply_patch", chatRequest.Messages[0].ToolCalls[0].Function.Name)
 	require.JSONEq(t, `{"input":"patch"}`, chatRequest.Messages[0].ToolCalls[0].Function.Arguments)
+	require.True(t, adapter.mappings()["apply_patch"].HistoryOnly)
 }
 
 func TestResponsesChatToolAdapter_EmptyAllowedTools(t *testing.T) {
@@ -1160,6 +1185,46 @@ func TestResponsesChatToolAdapter_EmptyAllowedTools(t *testing.T) {
 			require.NoError(t, err)
 			require.Empty(t, chatRequest.Tools)
 			require.Nil(t, chatRequest.ToolChoice)
+		})
+	}
+}
+
+func TestResponsesChatToolAdapter_OmittedAllowedToolsModeOmitsChatToolChoice(t *testing.T) {
+	tests := []struct {
+		name        string
+		allowedName string
+		wantTools   int
+	}{
+		{name: "available function", allowedName: "lookup", wantTools: 1},
+		{name: "filtered to no callable tools", allowedName: "missing", wantTools: 0},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			request := &llm.Request{
+				Tools: []llm.Tool{{
+					Type: llm.ToolTypeFunction,
+					Function: llm.Function{
+						Name: "lookup", Parameters: json.RawMessage(`{"type":"object"}`),
+					},
+				}},
+				ToolChoice: &llm.ToolChoice{
+					AllowedToolsSet: true,
+					AllowedTools:    []llm.ToolOption{{Type: llm.ToolTypeFunction, Name: tc.allowedName}},
+				},
+			}
+
+			chatRequest, _, err := requestFromLLMWithResponsesToolAdapter(request, ReasoningFieldNone)
+			require.NoError(t, err)
+			require.Nil(t, chatRequest.ToolChoice)
+			require.Len(t, chatRequest.Tools, tc.wantTools)
+
+			wire := make(map[string]json.RawMessage)
+			data, err := json.Marshal(chatRequest)
+			require.NoError(t, err)
+			require.NoError(t, json.Unmarshal(data, &wire))
+			_, exists := wire["tool_choice"]
+			require.False(t, exists)
 		})
 	}
 }
@@ -1413,7 +1478,7 @@ func TestMessageContentFromLLM_IgnoresCompactionParts(t *testing.T) {
 }
 
 func TestRequestFromLLM_IgnoresCompactionPartsInMessages(t *testing.T) {
-	req := RequestFromLLM(context.Background(), &llm.Request{
+	req := requireRequestFromLLM(t, &llm.Request{
 		Model: "gpt-4o",
 		Messages: []llm.Message{
 			{
@@ -1759,7 +1824,7 @@ func TestResponse_ToLLMResponse_WithCitations(t *testing.T) {
 }
 
 func TestRequestFromLLM_KeepsGoogleThoughtSignatureInRequestModel(t *testing.T) {
-	req := RequestFromLLM(context.Background(), &llm.Request{
+	req := requireRequestFromLLM(t, &llm.Request{
 		Model: "gemini-3-pro",
 		Messages: []llm.Message{
 			{
@@ -1877,7 +1942,7 @@ func TestApplyReasoningEffortMapping(t *testing.T) {
 // reasoning_effort: per-channel mapping is applied by the orchestrator on the
 // unified request before the outbound transformer runs, not in this converter.
 func TestRequestFromLLM_PreservesReasoningEffort(t *testing.T) {
-	req := RequestFromLLM(context.Background(), &llm.Request{
+	req := requireRequestFromLLM(t, &llm.Request{
 		Model:           "gpt-4",
 		ReasoningEffort: "xhigh",
 		Messages: []llm.Message{
@@ -2003,7 +2068,7 @@ func TestMessageFromLLM_ReasoningOnlyMessageKeepsContentField(t *testing.T) {
 // A reasoning-only turn keeps working across the full request conversion, which is
 // the path an OpenAI-compatible channel actually serializes to the wire.
 func TestRequestFromLLM_ReasoningOnlyMessageKeepsContentField(t *testing.T) {
-	req := RequestFromLLM(context.Background(), &llm.Request{
+	req := requireRequestFromLLM(t, &llm.Request{
 		Model: "local-model",
 		Messages: []llm.Message{
 			{Role: "user", Content: llm.MessageContent{Content: lo.ToPtr("hi")}},
@@ -2085,7 +2150,7 @@ func TestMessageContentPartFromLLM_NormalizesTextPartTypes(t *testing.T) {
 // Multi-part content is the path where Responses text types actually reach an
 // upstream: a lone text part is collapsed into a plain string before this point.
 func TestRequestFromLLM_NormalizesTextPartTypesInMessages(t *testing.T) {
-	req := RequestFromLLM(context.Background(), &llm.Request{
+	req := requireRequestFromLLM(t, &llm.Request{
 		Model: "gpt-4o",
 		Messages: []llm.Message{
 			{
@@ -2108,7 +2173,7 @@ func TestRequestFromLLM_NormalizesTextPartTypesInMessages(t *testing.T) {
 }
 
 func TestRequestFromLLM_MergesMultipleSystemMessages(t *testing.T) {
-	req := RequestFromLLM(context.Background(), &llm.Request{
+	req := requireRequestFromLLM(t, &llm.Request{
 		Model: "qwen-max",
 		Messages: []llm.Message{
 			{Role: "system", Content: llm.MessageContent{Content: lo.ToPtr("You are a coding agent.")}},
@@ -2129,7 +2194,7 @@ func TestRequestFromLLM_MergesMultipleSystemMessages(t *testing.T) {
 }
 
 func TestRequestFromLLM_MovesSingleLateSystemMessageToBeginning(t *testing.T) {
-	req := RequestFromLLM(context.Background(), &llm.Request{
+	req := requireRequestFromLLM(t, &llm.Request{
 		Model: "qwen-max",
 		Messages: []llm.Message{
 			{Role: "user", Content: llm.MessageContent{Content: lo.ToPtr("Hello")}},
@@ -2145,7 +2210,7 @@ func TestRequestFromLLM_MovesSingleLateSystemMessageToBeginning(t *testing.T) {
 }
 
 func TestRequestFromLLM_KeepsSingleSystemMessage(t *testing.T) {
-	req := RequestFromLLM(context.Background(), &llm.Request{
+	req := requireRequestFromLLM(t, &llm.Request{
 		Model: "qwen-max",
 		Messages: []llm.Message{
 			{Role: "system", Content: llm.MessageContent{Content: lo.ToPtr("You are a coding agent.")}},
@@ -2163,7 +2228,7 @@ func TestRequestFromLLM_KeepsSingleSystemMessage(t *testing.T) {
 // treat MultipleContent as authoritative on marshal), merging must emit only
 // the MultipleContent text and not duplicate the scalar.
 func TestRequestFromLLM_MergesSystemMessages_MultipleContentPrecedence(t *testing.T) {
-	req := RequestFromLLM(context.Background(), &llm.Request{
+	req := requireRequestFromLLM(t, &llm.Request{
 		Model: "qwen-max",
 		Messages: []llm.Message{
 			{
@@ -2199,7 +2264,7 @@ func TestRequestFromLLM_AllowedToolsToolChoice(t *testing.T) {
 	// An allowed_tools choice must keep its mode and tool subset on the Chat
 	// Completions wire; the plain named shape would emit an empty function
 	// name and silently lift the restriction (issue #2504).
-	req := RequestFromLLM(context.Background(), &llm.Request{
+	req := requireRequestFromLLM(t, &llm.Request{
 		Model:    "gpt-4o",
 		Messages: []llm.Message{{Role: "user", Content: llm.MessageContent{Content: lo.ToPtr("hi")}}},
 		Tools: []llm.Tool{
@@ -2225,7 +2290,7 @@ func TestRequestFromLLM_AllowedToolsToolChoice(t *testing.T) {
 
 func TestRequestFromLLM_NamedToolChoiceUnchanged(t *testing.T) {
 	// A named function choice keeps its existing single-tool wire shape.
-	req := RequestFromLLM(context.Background(), &llm.Request{
+	req := requireRequestFromLLM(t, &llm.Request{
 		Model:    "gpt-4o",
 		Messages: []llm.Message{{Role: "user", Content: llm.MessageContent{Content: lo.ToPtr("hi")}}},
 		Tools: []llm.Tool{
@@ -2272,7 +2337,7 @@ func TestRequestFromLLM_DowngradesResponsesToolLifecycle(t *testing.T) {
 		},
 	}
 
-	got := RequestFromLLM(context.Background(), req, ReasoningFieldContent)
+	got := requireRequestFromLLM(t, req, ReasoningFieldContent)
 	require.NotNil(t, got)
 
 	require.Len(t, got.Tools, 1)

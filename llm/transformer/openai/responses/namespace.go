@@ -42,15 +42,15 @@ func flattenRequestFunctionNames(src *llm.Request) (*llm.Request, error) {
 		if namespace != "" && name == "" {
 			return "", fmt.Errorf("%w: namespace function name is empty", transformer.ErrInvalidRequest)
 		}
-		flat := flatFunctionName(namespace, name)
-		identity := functionIdentity{namespace: namespace, name: name}
-		if previous, exists := identities[flat]; exists && previous != identity {
-			return "", fmt.Errorf("%w: namespace tool flat name %q conflicts with another function", transformer.ErrInvalidRequest, flat)
-		}
-		identities[flat] = identity
-		return flat, nil
+	flat := flatFunctionName(namespace, name)
+	identity := functionIdentity{namespace: namespace, name: name}
+	if previous, exists := identities[flat]; exists && previous != identity {
+		return "", fmt.Errorf("%w: namespace tool flat name %q conflicts with another function", transformer.ErrInvalidRequest, flat)
 	}
-	declared := make(map[string]bool)
+	identities[flat] = identity
+	return flat, nil
+	}
+	declared := make(map[string]llm.Tool)
 	for i := range req.Tools {
 		tool := &req.Tools[i]
 		if tool.Type != llm.ToolTypeFunction {
@@ -60,10 +60,16 @@ func flattenRequestFunctionNames(src *llm.Request) (*llm.Request, error) {
 		if err != nil {
 			return nil, err
 		}
-		if declared[flat] {
+		// Exact duplicate plain declarations are invalid input. Client-tool twins
+		// and flat-name collisions between different identities pass through: the
+		// Responses-to-Chat adapter renames or strictly reports them outbound.
+		if previous, duplicate := declared[flat]; duplicate &&
+			previous.Function.Namespace == tool.Function.Namespace &&
+			previous.Function.Name == tool.Function.Name &&
+			previous.ResponsesSourceType == "" && tool.ResponsesSourceType == "" {
 			return nil, fmt.Errorf("%w: duplicate function tool name %q", transformer.ErrInvalidRequest, flat)
 		}
-		declared[flat] = true
+		declared[flat] = *tool
 		tool.Function.Name = flat
 	}
 	for i := range req.Messages {
@@ -144,6 +150,7 @@ func mapResponseFunctionNames(src *llm.Response, nativeToUnified bool) *llm.Resp
 		return src
 	}
 	metadata := src.TransformerMetadata
+	var encoded map[string]string
 	convert := func(src *llm.Message) *llm.Message {
 		if src == nil {
 			return nil
@@ -155,12 +162,26 @@ func mapResponseFunctionNames(src *llm.Response, nativeToUnified bool) *llm.Resp
 			}
 			function := call.Function
 			if nativeToUnified {
-				function.Name = flatFunctionName(function.Namespace, function.Name)
+				if flat := flatFunctionName(function.Namespace, function.Name); flat != function.Name {
+					// Record the encoded identity so the reverse direction can
+					// confirm the flattened form even without request metadata
+					// (e.g. a bare stream round trip).
+					if encoded == nil {
+						encoded = make(map[string]string)
+					}
+					encoded[flat] = function.Namespace
+					function.Name = flat
+				}
 			} else {
 				if function.Namespace == "" {
 					function.Namespace = namespaceForName(metadata, function.Name)
+					function.Name = localFunctionName(function.Namespace, function.Name)
+				} else if namespaceForName(metadata, function.Name) == function.Namespace {
+					// Decode only when the mapping confirms the flattened form.
+					// An outbound adapter may already have restored the member
+					// name, which can itself carry the namespace prefix.
+					function.Name = localFunctionName(function.Namespace, function.Name)
 				}
-				function.Name = localFunctionName(function.Namespace, function.Name)
 			}
 			if function == call.Function {
 				continue
@@ -186,6 +207,30 @@ func mapResponseFunctionNames(src *llm.Response, nativeToUnified bool) *llm.Resp
 			result = &copied
 		}
 		result.Choices[i].Message, result.Choices[i].Delta = message, delta
+	}
+	if len(encoded) > 0 {
+		metadata = maps.Clone(metadata)
+		if metadata == nil {
+			metadata = make(map[string]any, 1)
+		}
+		mapping := make(map[string]string, len(encoded))
+		switch existing := metadata[namespaceMappingMetadataKey].(type) {
+		case map[string]string:
+			maps.Copy(mapping, existing)
+		case map[string]any:
+			for key, value := range existing {
+				if name, ok := value.(string); ok {
+					mapping[key] = name
+				}
+			}
+		}
+		maps.Copy(mapping, encoded)
+		metadata[namespaceMappingMetadataKey] = mapping
+		if result == src {
+			copied := *src
+			result = &copied
+		}
+		result.TransformerMetadata = metadata
 	}
 	return result
 }

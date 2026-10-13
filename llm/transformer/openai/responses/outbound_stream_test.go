@@ -1711,8 +1711,37 @@ func TestOutboundTransformer_TransformStream_CompletedWithUsageCarriesEchoFields
 	raw, ok := completedChunk.TransformerMetadata[responsesEchoFieldsTransformerMetadataKey]
 	require.True(t, ok, "completed chunk must carry echo metadata on the usage path")
 
-	echo, ok := raw.(*Response)
+	echo, ok := raw.(json.RawMessage)
 	require.True(t, ok)
-	require.NotNil(t, echo.Conversation)
-	require.Equal(t, "conv_echo", echo.Conversation.ID)
+	var decoded Response
+	require.NoError(t, json.Unmarshal(echo, &decoded))
+	require.NotNil(t, decoded.Conversation)
+	require.Equal(t, "conv_echo", decoded.Conversation.ID)
+}
+
+func TestEchoFieldsSurviveTransformerMetadataJSONRoundTrip(t *testing.T) {
+	echo := &Response{ID: "resp_echo", Conversation: &ResponseConversation{ID: "conv_echo"}}
+	encoded, err := json.Marshal(echo)
+	require.NoError(t, err)
+
+	metadata := map[string]any{
+		responsesEchoFieldsTransformerMetadataKey: json.RawMessage(encoded),
+	}
+	serialized, err := json.Marshal(metadata)
+	require.NoError(t, err)
+	var decoded map[string]any
+	require.NoError(t, json.Unmarshal(serialized, &decoded))
+
+	stream := &responsesInboundStream{}
+	stream.captureEchoFields(decoded)
+	require.NotNil(t, stream.echoResponse)
+	require.Equal(t, "resp_echo", stream.echoResponse.ID)
+	require.NotNil(t, stream.echoResponse.Conversation)
+	require.Equal(t, "conv_echo", stream.echoResponse.Conversation.ID)
+}
+
+func TestEqualJSONValuesTreatsEquivalentNumbersAsEqual(t *testing.T) {
+	require.True(t, equalJSONValues(`{"value":1}`, `{"value":1.0}`))
+	require.True(t, equalJSONValues(`[1e2]`, `[100.0]`))
+	require.False(t, equalJSONValues(`{"value":1}`, `{"value":2}`))
 }

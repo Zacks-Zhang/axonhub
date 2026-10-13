@@ -15,7 +15,12 @@ func TestAllowedToolsChoiceJSONRoundTrip(t *testing.T) {
 		require.NoError(t, err)
 		var decoded ToolChoice
 		require.NoError(t, json.Unmarshal(raw, &decoded))
-		require.Equal(t, original, decoded)
+		// The merged decoder also mirrors the allowlist into the legacy
+		// AllowedTools representation used by Chat downgrade paths.
+		expected := original
+		expected.AllowedTools = expected.Tools
+		expected.AllowedToolsSet = true
+		require.Equal(t, expected, decoded)
 	}
 }
 

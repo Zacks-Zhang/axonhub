@@ -3,6 +3,7 @@ package responses
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -614,6 +615,171 @@ func TestMergeRawOnlyTools_RejectsMismatchedNamespaceWrapper(t *testing.T) {
 	require.Nil(t, tools)
 }
 
+func TestMergeRawOnlyTools_PropagatesMalformedStructuredTools(t *testing.T) {
+	requestExt := &llm.OpenAIResponsesRequestExtensions{RawTools: []llm.OpenAIResponsesRawFragment{{
+		Type: "future_server_tool", Name: "hosted", OriginalIndex: 0,
+		Raw: json.RawMessage(`{"type":"future_server_tool","name":"hosted"}`),
+	}}}
+
+	tools, replayed, err := mergeRawOnlyTools(json.RawMessage(`{}`), requestExt, nil, false)
+	require.Error(t, err)
+	require.False(t, replayed)
+	require.Nil(t, tools)
+}
+
+func TestBuildReplayPlan(t *testing.T) {
+	currentFromRaw := func(t *testing.T, raw string) []llm.Tool {
+		t.Helper()
+		var rawTool Tool
+		require.NoError(t, json.Unmarshal([]byte(raw), &rawTool))
+		tools, err := convertToolsToLLM([]Tool{rawTool})
+		require.NoError(t, err)
+		require.NotEmpty(t, tools)
+		for i := range tools {
+			tools[i].ResponsesRawID = fmt.Sprintf("tools:%d", i)
+		}
+		return tools
+	}
+
+	futureClientRaw := `{"type":"future_client_tool","name":"lookup","execution":"client","parameters":{"type":"object"}}`
+	namespaceRaw := `{
+		"type":"namespace","name":"workspace",
+		"tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}]
+	}`
+	lossyNamespaceRaw := `{
+		"type":"namespace","name":"workspace",
+		"tools":[{"type":"future_server_tool","name":"hosted"}]
+	}`
+
+	tests := []struct {
+		name            string
+		raw             string
+		current         func(t *testing.T) []llm.Tool
+		structured      []json.RawMessage
+		replayRawInput  bool
+		expectedError   string
+		expectedPlan    bool
+		expectedToolIDs []string
+	}{
+		{
+			name:            "exact raw group consumes its structured index",
+			raw:             futureClientRaw,
+			current:         func(t *testing.T) []llm.Tool { return currentFromRaw(t, futureClientRaw) },
+			structured:      []json.RawMessage{json.RawMessage(`{"type":"function","name":"consumed"}`)},
+			expectedPlan:    true,
+			expectedToolIDs: []string{"future_client_tool/lookup"},
+		},
+		{
+			name: "structured index advances after a replayed raw group",
+			raw:  futureClientRaw,
+			current: func(t *testing.T) []llm.Tool {
+				return append(currentFromRaw(t, futureClientRaw), llm.Tool{
+					Type: llm.ToolTypeFunction,
+					Function: llm.Function{
+						Name: "plain", Parameters: json.RawMessage(`{"type":"object"}`),
+					},
+				})
+			},
+			structured: []json.RawMessage{
+				json.RawMessage(`{"type":"function","name":"consumed"}`),
+				json.RawMessage(`{"type":"function","name":"plain","parameters":{"type":"object"}}`),
+			},
+			expectedPlan:    true,
+			expectedToolIDs: []string{"future_client_tool/lookup", "function/plain"},
+		},
+		{
+			name:            "exact namespace consumes one structured wrapper",
+			raw:             namespaceRaw,
+			current:         func(t *testing.T) []llm.Tool { return currentFromRaw(t, namespaceRaw) },
+			structured:      []json.RawMessage{json.RawMessage(`{"type":"namespace","name":"workspace","tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}]}`)},
+			expectedPlan:    true,
+			expectedToolIDs: []string{"namespace/workspace"},
+		},
+		{
+			name:         "namespace wrapper mismatch falls back",
+			raw:          namespaceRaw,
+			current:      func(t *testing.T) []llm.Tool { return currentFromRaw(t, namespaceRaw) },
+			structured:   []json.RawMessage{json.RawMessage(`{"type":"namespace","name":"other","tools":[]}`)},
+			expectedPlan: false,
+		},
+		{
+			name:         "missing structured index falls back",
+			raw:          futureClientRaw,
+			current:      func(t *testing.T) []llm.Tool { return currentFromRaw(t, futureClientRaw) },
+			expectedPlan: false,
+		},
+		{
+			name:            "lossy namespace replays when unchanged",
+			raw:             lossyNamespaceRaw,
+			current:         func(t *testing.T) []llm.Tool { return currentFromRaw(t, lossyNamespaceRaw) },
+			expectedPlan:    true,
+			expectedToolIDs: []string{"namespace/workspace"},
+		},
+		{
+			name: "modified unsupported namespace fails closed",
+			raw:  lossyNamespaceRaw,
+			current: func(t *testing.T) []llm.Tool {
+				return append(currentFromRaw(t, lossyNamespaceRaw), llm.Tool{
+					Type: llm.ToolTypeResponsesOpaqueTool,
+					ResponseOpaqueTool: &llm.ResponseOpaqueTool{
+						SourceType: "future_server_tool", Name: "added", Namespace: "workspace",
+					},
+					ResponsesOrigin: "raw_tool",
+				})
+			},
+			expectedError: `unsupported_namespace_replay: namespace "workspace"`,
+		},
+		{
+			name: "additional tools depend on raw input replay mode",
+			raw:  futureClientRaw,
+			current: func(t *testing.T) []llm.Tool {
+				return []llm.Tool{{
+					Type: llm.ToolTypeFunction,
+					Function: llm.Function{
+						Name: "lookup", Parameters: json.RawMessage(`{"type":"object"}`),
+					},
+					ResponsesOrigin: "additional_tools",
+				}}
+			},
+			structured:     []json.RawMessage{json.RawMessage(`{"type":"function","name":"lookup","parameters":{"type":"object"}}`)},
+			replayRawInput: true,
+			expectedPlan:   false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			groups := buildRawToolGroups([]llm.OpenAIResponsesRawFragment{{
+				Type: "test", OriginalIndex: 0, Raw: json.RawMessage(tt.raw),
+			}})
+			require.Len(t, groups, 1)
+
+			plan, err := buildReplayPlan(tt.current(t), groups, tt.structured, tt.replayRawInput)
+			if tt.expectedError != "" {
+				require.Nil(t, plan)
+				require.ErrorContains(t, err, tt.expectedError)
+				return
+			}
+			require.NoError(t, err)
+			if !tt.expectedPlan {
+				require.Nil(t, plan)
+				return
+			}
+			require.NotNil(t, plan)
+			require.True(t, plan.replayed)
+			require.Len(t, plan.steps, len(tt.expectedToolIDs))
+			for i, step := range plan.steps {
+				var tool struct {
+					Type string `json:"type"`
+					Name string `json:"name"`
+				}
+				require.NoError(t, json.Unmarshal(step, &tool))
+				require.Equal(t, tt.expectedToolIDs[i], tool.Type+"/"+tool.Name)
+			}
+		})
+	}
+}
+
 func TestRequestExtensions_ModifiedRawFunctionLikeToolsUseCurrentSchema(t *testing.T) {
 	tests := []struct {
 		name           string
@@ -1115,6 +1281,13 @@ func TestRawUnsupportedToolChoicePreservesOnlyUnrepresentedSelectors(t *testing.
 			require.JSONEq(t, tc.raw, string(preserved))
 		})
 	}
+}
+
+func TestRawRepresentedToolChoiceRequiresCurrentSemanticMatch(t *testing.T) {
+	mode := "auto"
+	current := ToolChoice{Mode: &mode}
+	preserved := rawUnsupportedToolChoice(&current, json.RawMessage(`{"mode":"required"}`))
+	require.JSONEq(t, `{"mode":"required"}`, string(preserved))
 }
 
 func TestRequestExtensions_ReplaysUnrepresentedToolChoices(t *testing.T) {

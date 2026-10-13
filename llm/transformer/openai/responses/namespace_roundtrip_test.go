@@ -1,4 +1,4 @@
-package responses
+package responses_test
 
 import (
 	"encoding/json"
@@ -15,43 +15,44 @@ import (
 	"github.com/looplj/axonhub/llm/transformer/gemini"
 	"github.com/looplj/axonhub/llm/transformer/ollama"
 	"github.com/looplj/axonhub/llm/transformer/openai"
+	"github.com/looplj/axonhub/llm/transformer/openai/responses"
 )
 
 const namespaceReviewRequest = `{"model":"test","tools":[{"type":"namespace","name":"docs","tools":[{"type":"function","name":"search","parameters":{"type":"object","properties":{}}}]}],"input":[{"type":"function_call","call_id":"call_1","name":"search","namespace":"docs","arguments":"{}"},{"type":"function_call_output","call_id":"call_1","output":"ok"}],"tool_choice":"auto"}`
 
 func TestNamespaceReview_ResponsesHistory(t *testing.T) {
-	req, err := NewInboundTransformer().TransformRequest(t.Context(), &httpclient.Request{Body: []byte(namespaceReviewRequest)})
+	req, err := responses.NewInboundTransformer().TransformRequest(t.Context(), &httpclient.Request{Body: []byte(namespaceReviewRequest)})
 	require.NoError(t, err)
-	out, err := NewOutboundTransformer("https://example.com", "test")
+	out, err := responses.NewOutboundTransformer("https://example.com", "test")
 	require.NoError(t, err)
 	wire, err := out.TransformRequest(t.Context(), req)
 	require.NoError(t, err)
-	var body Request
+	var body responses.Request
 	require.NoError(t, json.Unmarshal(wire.Body, &body))
 	require.Equal(t, "search", body.Input.Items[0].Name)
 	require.Equal(t, "docs", body.Input.Items[0].Namespace)
 }
 
 func TestNamespaceReview_PreservesMultiFunctionGroup(t *testing.T) {
-	var body Request
+	var body responses.Request
 	require.NoError(t, json.Unmarshal([]byte(namespaceReviewRequest), &body))
-	body.Tools[0].Tools = append(body.Tools[0].Tools, Tool{Type: "function", Name: "read"})
+	body.Tools[0].Tools = append(body.Tools[0].Tools, responses.Tool{Type: "function", Name: "read"})
 	raw, err := json.Marshal(body)
 	require.NoError(t, err)
-	req, err := NewInboundTransformer().TransformRequest(t.Context(), &httpclient.Request{Body: raw})
+	req, err := responses.NewInboundTransformer().TransformRequest(t.Context(), &httpclient.Request{Body: raw})
 	require.NoError(t, err)
-	native, err := NewOutboundTransformer("https://example.com", "test")
+	native, err := responses.NewOutboundTransformer("https://example.com", "test")
 	require.NoError(t, err)
 	wire, err := native.TransformRequest(t.Context(), req)
 	require.NoError(t, err)
-	var result Request
+	var result responses.Request
 	require.NoError(t, json.Unmarshal(wire.Body, &result))
 	require.Equal(t, body.ToolChoice, result.ToolChoice)
 	require.Len(t, result.Tools[0].Tools, 2)
 }
 
 func TestNamespaceReview_LateStreamName(t *testing.T) {
-	req, err := NewInboundTransformer().TransformRequest(t.Context(), &httpclient.Request{Body: []byte(namespaceReviewRequest)})
+	req, err := responses.NewInboundTransformer().TransformRequest(t.Context(), &httpclient.Request{Body: []byte(namespaceReviewRequest)})
 	require.NoError(t, err)
 	chat, err := openai.NewOutboundTransformer("https://example.com", "test")
 	require.NoError(t, err)
@@ -64,12 +65,12 @@ func TestNamespaceReview_LateStreamName(t *testing.T) {
 		{Data: []byte(`[DONE]`)},
 	}))
 	require.NoError(t, err)
-	events, err := NewInboundTransformer().TransformStream(t.Context(), streamWithTestMetadata(req, source))
+	events, err := responses.NewInboundTransformer().TransformStream(t.Context(), streamWithTestMetadata(req, source))
 	require.NoError(t, err)
 	defer events.Close()
 	count := 0
 	for events.Next() {
-		var event StreamEvent
+		var event responses.StreamEvent
 		require.NoError(t, json.Unmarshal(events.Current().Data, &event))
 		if event.Item != nil && event.Item.Type == "function_call" {
 			count++
@@ -86,17 +87,17 @@ func TestNamespaceReview_LateStreamName(t *testing.T) {
 }
 
 func TestNamespaceReview_ChatThenResponses(t *testing.T) {
-	req, err := NewInboundTransformer().TransformRequest(t.Context(), &httpclient.Request{Body: []byte(namespaceReviewRequest)})
+	req, err := responses.NewInboundTransformer().TransformRequest(t.Context(), &httpclient.Request{Body: []byte(namespaceReviewRequest)})
 	require.NoError(t, err)
 	chat, err := openai.NewOutboundTransformer("https://example.com", "test")
 	require.NoError(t, err)
 	_, err = chat.TransformRequest(t.Context(), req)
 	require.NoError(t, err)
-	native, err := NewOutboundTransformer("https://example.com", "test")
+	native, err := responses.NewOutboundTransformer("https://example.com", "test")
 	require.NoError(t, err)
 	wire, err := native.TransformRequest(t.Context(), req)
 	require.NoError(t, err)
-	var body Request
+	var body responses.Request
 	require.NoError(t, json.Unmarshal(wire.Body, &body))
 	require.Equal(t, "search", body.Input.Items[0].Name)
 	require.Equal(t, "docs", body.Input.Items[0].Namespace)
@@ -106,9 +107,9 @@ func TestNamespaceReview_ChatThenResponses(t *testing.T) {
 
 func TestNamespaceReview_RawNamespaceAndCatalogChange(t *testing.T) {
 	data := []byte(`{"model":"test","input":"hi","tools":[{"type":"function","name":"plain"},{"type":"namespace","name":"docs","description":"Keep this description","tools":[{"type":"function","name":"search","defer_loading":true},{"type":"custom","name":"shell","format":{"type":"text"}}]},{"type":"namespace","name":"other","tools":[{"type":"function","name":"search"}]}]}`)
-	req, err := NewInboundTransformer().TransformRequest(t.Context(), &httpclient.Request{Body: data})
+	req, err := responses.NewInboundTransformer().TransformRequest(t.Context(), &httpclient.Request{Body: data})
 	require.NoError(t, err)
-	native, err := NewOutboundTransformer("https://example.com", "test")
+	native, err := responses.NewOutboundTransformer("https://example.com", "test")
 	require.NoError(t, err)
 	wire, err := native.TransformRequest(t.Context(), req)
 	require.NoError(t, err)
@@ -120,10 +121,13 @@ func TestNamespaceReview_RawNamespaceAndCatalogChange(t *testing.T) {
 	req.Tools[1].Function.Name = "docs__read"
 	wire, err = native.TransformRequest(t.Context(), req)
 	require.NoError(t, err)
-	var updated Request
+	var updated responses.Request
 	require.NoError(t, json.Unmarshal(wire.Body, &updated))
 	require.Equal(t, "read", updated.Tools[1].Tools[0].Name)
-	require.Len(t, updated.Tools[1].Tools, 1)
+	// Custom members keep their namespace identity and stay inside the fresh
+	// wrapper alongside the changed function member.
+	require.Len(t, updated.Tools[1].Tools, 2)
+	require.Equal(t, "shell", updated.Tools[1].Tools[1].Name)
 }
 
 func TestNamespaceReview_LegacyOutboundNames(t *testing.T) {
@@ -135,7 +139,7 @@ func TestNamespaceReview_LegacyOutboundNames(t *testing.T) {
 		{"gemini", gemini.NewOutboundTransformer},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			req, err := NewInboundTransformer().TransformRequest(t.Context(), &httpclient.Request{Body: []byte(namespaceReviewRequest)})
+			req, err := responses.NewInboundTransformer().TransformRequest(t.Context(), &httpclient.Request{Body: []byte(namespaceReviewRequest)})
 			require.NoError(t, err)
 			req.ToolChoice = &llm.ToolChoice{NamedToolChoice: &llm.NamedToolChoice{Type: "function", Function: llm.ToolFunction{Name: "docs__search"}}}
 			out, err := tt.factory("https://example.com", "test")
@@ -175,7 +179,7 @@ func TestNamespaceReview_OllamaOutboundNames(t *testing.T) {
 			{"type":"function_call_output","call_id":"call_2","output":"ok"}
 		]
 	}`)
-	req, err := NewInboundTransformer().TransformRequest(t.Context(), &httpclient.Request{Body: data})
+	req, err := responses.NewInboundTransformer().TransformRequest(t.Context(), &httpclient.Request{Body: data})
 	require.NoError(t, err)
 	before, err := json.Marshal(req)
 	require.NoError(t, err)
@@ -213,8 +217,8 @@ func TestNamespaceReview_OllamaOutboundNames(t *testing.T) {
 				{"function":{"name":"plain__function","arguments":{}}},
 				{"function":{"name":"retired__query","arguments":{}}}
 			]},"done":true}`)
-			inbound := NewInboundTransformer()
-			var result Response
+			inbound := responses.NewInboundTransformer()
+			var result responses.Response
 			if streaming {
 				stream, err := out.TransformStream(t.Context(), wire, streams.SliceStream([]*httpclient.StreamEvent{{Data: raw}}))
 				require.NoError(t, err)
@@ -222,7 +226,7 @@ func TestNamespaceReview_OllamaOutboundNames(t *testing.T) {
 				require.NoError(t, err)
 				defer client.Close()
 				for client.Next() {
-					var event StreamEvent
+					var event responses.StreamEvent
 					require.NoError(t, json.Unmarshal(client.Current().Data, &event))
 					if event.Type == "response.completed" {
 						require.NotNil(t, event.Response)

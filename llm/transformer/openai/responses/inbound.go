@@ -245,6 +245,9 @@ func convertToLLMRequest(req *Request, rawBody ...[]byte) (*llm.Request, error) 
 	}
 
 	if len(req.Tools) > 0 {
+		if err := validateUniqueTopLevelNamespaces(req.Tools); err != nil {
+			return nil, err
+		}
 		tools, err := convertToolsToLLMWithRawIDs(req.Tools, "tools")
 		if err != nil {
 			return nil, err
@@ -277,22 +280,8 @@ func convertToLLMRequest(req *Request, rawBody ...[]byte) (*llm.Request, error) 
 
 	chatReq.Messages = messages
 
-<<<<<<< HEAD
 	// Preserve tool selection independently of namespace declaration normalization.
 	chatReq.ToolChoice = convertToolChoiceToLLM(req.ToolChoice)
-=======
-	if len(req.Tools) > 0 {
-		if err := validateUniqueTopLevelNamespaces(req.Tools); err != nil {
-			return nil, err
-		}
-		tools, err := convertToolsToLLMWithRawIDs(req.Tools, "tools")
-		if err != nil {
-			return nil, err
-		}
-
-		chatReq.Tools = tools
-	}
->>>>>>> c805c9bf (feat(responses): preserve namespace tool compatibility)
 
 	// additional_tools and client tool_search_output are position-sensitive in
 	// Responses. Promote their definitions for non-Responses downstreams while
@@ -338,22 +327,21 @@ func convertToLLMRequest(req *Request, rawBody ...[]byte) (*llm.Request, error) 
 		chatReq.Verbosity = req.Text.Verbosity
 	}
 
-	if len(rawBody) > 0 {
-		attachOpenAIResponsesRequestExtensions(chatReq, req, rawBody[0])
-	}
-
 	result, err := flattenRequestFunctionNames(chatReq)
 	if err != nil {
 		return nil, err
 	}
+
+	// Signatures stored for replay must describe the same flattened
+	// representation the outbound side will compare against.
+	if len(rawBody) > 0 {
+		attachOpenAIResponsesRequestExtensions(result, req, rawBody[0])
+	}
+
 	result.TransformerMetadata = namespaceMetadata(result)
 	return result, nil
 }
 
-<<<<<<< HEAD
-// convertToolChoiceToLLM preserves Responses tool selection without imposing
-// Chat Completions naming or selection restrictions on other outbounds.
-=======
 func validateUniqueTopLevelNamespaces(tools []Tool) error {
 	seen := make(map[string]struct{}, len(tools))
 	for _, tool := range tools {
@@ -371,8 +359,8 @@ func validateUniqueTopLevelNamespaces(tools []Tool) error {
 	return nil
 }
 
-// convertToolChoiceToLLM converts Responses API ToolChoice to llm.ToolChoice.
->>>>>>> c805c9bf (feat(responses): preserve namespace tool compatibility)
+// convertToolChoiceToLLM preserves Responses tool selection without imposing
+// Chat Completions naming or selection restrictions on other outbounds.
 func convertToolChoiceToLLM(src *ToolChoice) *llm.ToolChoice {
 	if src == nil {
 		return nil
@@ -552,6 +540,12 @@ func collectToolCallOutputs(items []Item, emitted []bool, from int, toolCalls []
 
 		item := &items[j]
 		if _, ok := pending[item.CallID]; !ok {
+			continue
+		}
+		if isToolCallItemType(item.Type) {
+			// A repeated call_id starts a new call round: outputs after it
+			// belong to that later call, not to the one being collected.
+			delete(pending, item.CallID)
 			continue
 		}
 		if !isToolOutputItemType(item.Type) {
@@ -1182,148 +1176,9 @@ func convertToolsToLLMWithRawIDs(tools []Tool, prefix string) ([]llm.Tool, error
 func convertToolsToLLM(tools []Tool) ([]llm.Tool, error) {
 	result := make([]llm.Tool, 0, len(tools))
 	for _, tool := range tools {
-<<<<<<< HEAD
-		switch tool.Type {
-		case "function":
-			params, err := json.Marshal(tool.Parameters)
-			if err != nil {
-				return nil, fmt.Errorf("failed to marshal function parameters: %w", err)
-			}
-
-			result = append(result, llm.Tool{
-				Type: "function",
-				Function: llm.Function{
-					Name:         tool.Name,
-					Description:  tool.Description,
-					Parameters:   params,
-					Strict:       tool.Strict,
-					DeferLoading: tool.DeferLoading,
-				},
-			})
-
-		case "image_generation":
-			result = append(result, llm.Tool{
-				Type: llm.ToolTypeImageGeneration,
-				ImageGeneration: &llm.ImageGeneration{
-					Background:        tool.Background,
-					InputFidelity:     tool.InputFidelity,
-					Moderation:        tool.Moderation,
-					OutputCompression: tool.OutputCompression,
-					OutputFormat:      tool.OutputFormat,
-					PartialImages:     tool.PartialImages,
-					Quality:           tool.Quality,
-					Size:              tool.Size,
-				},
-			})
-
-		case "web_search":
-			webSearch := &llm.WebSearch{}
-			if tool.Filters != nil {
-				webSearch.AllowedDomains = append(webSearch.AllowedDomains, tool.Filters.AllowedDomains...)
-			}
-			if tool.UserLocation != nil {
-				locationType := tool.UserLocation.Type
-				if locationType == "" {
-					locationType = "approximate"
-				}
-				webSearch.UserLocation = llm.WebSearchToolUserLocation{
-					Type:     locationType,
-					City:     tool.UserLocation.City,
-					Country:  tool.UserLocation.Country,
-					Region:   tool.UserLocation.Region,
-					Timezone: tool.UserLocation.Timezone,
-				}
-			}
-			result = append(result, llm.Tool{
-				Type:      llm.ToolTypeWebSearch,
-				WebSearch: webSearch,
-			})
-
-		case "custom":
-			customTool := &llm.ResponseCustomTool{
-				Name:        tool.Name,
-				Description: tool.Description,
-			}
-			if tool.Format != nil {
-				customTool.Format = &llm.ResponseCustomToolFormat{
-					Type:       tool.Format.Type,
-					Syntax:     tool.Format.Syntax,
-					Definition: tool.Format.Definition,
-				}
-			}
-
-			result = append(result, llm.Tool{
-				Type:               llm.ToolTypeResponsesCustomTool,
-				ResponseCustomTool: customTool,
-			})
-
-		case "tool_search":
-			params, err := json.Marshal(tool.Parameters)
-			if err != nil {
-				return nil, fmt.Errorf("failed to marshal tool search parameters: %w", err)
-			}
-			result = append(result, llm.Tool{
-				Type: llm.ToolTypeResponsesToolSearch,
-				ResponseToolSearch: &llm.ResponseToolSearch{
-					Execution:   tool.Execution,
-					Description: tool.Description,
-					Parameters:  params,
-				},
-			})
-
-		case "namespace":
-			for _, subTool := range tool.Tools {
-				if subTool.Type != "function" && !isGenericClientFunctionLike(subTool) {
-					result = append(result, opaqueResponsesTool(subTool, "raw_tool", tool.Name))
-					continue
-				}
-
-				params, err := json.Marshal(subTool.Parameters)
-				if err != nil {
-					return nil, fmt.Errorf("failed to marshal namespace tool parameters: %w", err)
-				}
-
-				converted := llm.Tool{
-					Type: "function",
-					Function: llm.Function{
-						Name:         subTool.Name,
-						Namespace:    tool.Name,
-						Description:  subTool.Description,
-						Parameters:   params,
-						Strict:       subTool.Strict,
-						DeferLoading: subTool.DeferLoading,
-					},
-				}
-				if subTool.Type != "function" {
-					converted.ResponsesOrigin = "raw_tool"
-					converted.ResponsesSourceType = subTool.Type
-				}
-				result = append(result, converted)
-			}
-
-		default:
-			if isGenericClientFunctionLike(tool) {
-				params, err := json.Marshal(tool.Parameters)
-				if err != nil {
-					return nil, fmt.Errorf("failed to marshal %s tool parameters: %w", tool.Type, err)
-				}
-				result = append(result, llm.Tool{
-					Type: "function",
-					Function: llm.Function{
-						Name: tool.Name, Description: tool.Description,
-						Parameters: params, Strict: tool.Strict, DeferLoading: tool.DeferLoading,
-					},
-					ResponsesOrigin:     "raw_tool",
-					ResponsesSourceType: tool.Type,
-				})
-				continue
-			}
-			result = append(result, opaqueResponsesTool(tool, "raw_tool", ""))
-=======
 		converted, err := convertToolDeclaration(tool, "")
 		if err != nil {
 			return nil, err
->>>>>>> c805c9bf (feat(responses): preserve namespace tool compatibility)
 		}
 		result = append(result, converted...)
 	}
@@ -1355,7 +1210,6 @@ func convertToolDeclaration(tool Tool, namespace string) ([]llm.Tool, error) {
 			DeferLoading: tool.DeferLoading,
 		}
 		if namespace != "" {
-			function.Name = namespaceFunctionName(namespace, tool.Name)
 			function.Namespace = namespace
 		}
 		return []llm.Tool{{Type: "function", Function: function}}, nil
@@ -1444,7 +1298,6 @@ func convertToolDeclaration(tool Tool, namespace string) ([]llm.Tool, error) {
 			ResponsesSourceType: tool.Type,
 		}
 		if namespace != "" {
-			converted.Function.Name = namespaceFunctionName(namespace, tool.Name)
 			converted.Function.Namespace = namespace
 		}
 		return []llm.Tool{converted}, nil
@@ -1634,7 +1487,7 @@ func convertToResponsesAPIResponse(chatResp *llm.Response) *Response {
 		// Handle tool calls (function calls and custom tool calls)
 		if len(message.ToolCalls) > 0 {
 			toolCallStatus := "completed"
-			if choice.FinishReason != nil && isAbnormalResponsesFinishReason(*choice.FinishReason) {
+			if choice.FinishReason != nil && IsAbnormalChatFinishReason(*choice.FinishReason) {
 				toolCallStatus = "in_progress"
 			}
 			for _, toolCall := range message.ToolCalls {

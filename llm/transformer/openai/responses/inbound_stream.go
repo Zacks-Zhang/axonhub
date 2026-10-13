@@ -345,7 +345,7 @@ func (s *responsesInboundStream) Next() bool {
 		if choice.FinishReason != nil && !s.hasFinished {
 			s.hasFinished = true
 			s.finishReason = *choice.FinishReason
-			abnormalFinish := isAbnormalResponsesFinishReason(s.finishReason)
+			abnormalFinish := IsAbnormalChatFinishReason(s.finishReason)
 
 			// Map the finish_reason to the final Responses status and event type.
 			switch *choice.FinishReason {
@@ -532,6 +532,26 @@ func (s *responsesInboundStream) captureEchoFields(metadata map[string]any) {
 	}
 	if echo, ok := raw.(*Response); ok {
 		s.echoResponse = echo
+		return
+	}
+	switch value := raw.(type) {
+	case json.RawMessage:
+		s.decodeEchoFields([]byte(value))
+	case []byte:
+		s.decodeEchoFields(value)
+	case string:
+		s.decodeEchoFields([]byte(value))
+	case map[string]any:
+		if encoded, err := json.Marshal(value); err == nil {
+			s.decodeEchoFields(encoded)
+		}
+	}
+}
+
+func (s *responsesInboundStream) decodeEchoFields(data []byte) {
+	var echo Response
+	if json.Unmarshal(data, &echo) == nil {
+		s.echoResponse = &echo
 	}
 }
 

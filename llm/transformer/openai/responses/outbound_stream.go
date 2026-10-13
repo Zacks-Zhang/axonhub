@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/big"
 	"net/http"
 	"reflect"
 	"strings"
@@ -111,7 +112,9 @@ func (s *responsesOutboundStream) attachEchoFields(resp *llm.Response) {
 	if resp.TransformerMetadata == nil {
 		resp.TransformerMetadata = map[string]any{}
 	}
-	resp.TransformerMetadata[responsesEchoFieldsTransformerMetadataKey] = s.state.echoResponse
+	if encoded, err := json.Marshal(s.state.echoResponse); err == nil {
+		resp.TransformerMetadata[responsesEchoFieldsTransformerMetadataKey] = json.RawMessage(encoded)
+	}
 }
 
 func (s *responsesOutboundStream) Next() bool {
@@ -844,6 +847,18 @@ func (s *responsesOutboundStream) transformStreamChunk(event *httpclient.StreamE
 		// carries them even when it is enqueued and returned early.
 		s.attachEchoFields(resp)
 
+		// Attach terminal details for the same reason: the early usage return
+		// below would otherwise skip the post-switch attachment.
+		if streamEvent.Response != nil && (streamEvent.Response.Error != nil || streamEvent.Response.IncompleteDetails != nil) {
+			if resp.TransformerMetadata == nil {
+				resp.TransformerMetadata = make(map[string]any)
+			}
+			resp.TransformerMetadata[responsesTerminalDetailsTransformerMetadataKey] = responsesTerminalDetails{
+				Error:             streamEvent.Response.Error,
+				IncompleteDetails: streamEvent.Response.IncompleteDetails,
+			}
+		}
+
 		// Second event: usage (if available)
 		if streamEvent.Response != nil && streamEvent.Response.Usage != nil {
 			s.state.usage = streamEvent.Response.Usage.ToUsage()
@@ -1077,7 +1092,49 @@ func equalJSONValues(left, right string) bool {
 		return false
 	}
 
-	return reflect.DeepEqual(leftValue, rightValue)
+	return equalDecodedJSONValues(leftValue, rightValue)
+}
+
+func equalDecodedJSONValues(left, right any) bool {
+	switch leftValue := left.(type) {
+	case json.Number:
+		rightValue, ok := right.(json.Number)
+		if !ok {
+			return false
+		}
+		if leftValue.String() == rightValue.String() {
+			return true
+		}
+		var leftRat, rightRat big.Rat
+		_, leftOK := leftRat.SetString(leftValue.String())
+		_, rightOK := rightRat.SetString(rightValue.String())
+		return leftOK && rightOK && leftRat.Cmp(&rightRat) == 0
+	case []any:
+		rightValue, ok := right.([]any)
+		if !ok || len(leftValue) != len(rightValue) {
+			return false
+		}
+		for index := range leftValue {
+			if !equalDecodedJSONValues(leftValue[index], rightValue[index]) {
+				return false
+			}
+		}
+		return true
+	case map[string]any:
+		rightValue, ok := right.(map[string]any)
+		if !ok || len(leftValue) != len(rightValue) {
+			return false
+		}
+		for key, leftItem := range leftValue {
+			rightItem, exists := rightValue[key]
+			if !exists || !equalDecodedJSONValues(leftItem, rightItem) {
+				return false
+			}
+		}
+		return true
+	default:
+		return reflect.DeepEqual(left, right)
+	}
 }
 
 // decodeJSONValue preserves numeric lexemes so semantic comparisons do not

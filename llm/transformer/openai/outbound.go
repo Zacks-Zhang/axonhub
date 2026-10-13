@@ -146,7 +146,9 @@ func (t *OutboundTransformer) APIFormat() llm.APIFormat {
 // requests. Compact requests remain unsupported by this Chat endpoint.
 func (t *OutboundTransformer) ResponsesRequestCapabilities(req *llm.Request) transformer.ResponsesRequestCapabilities {
 	return transformer.ResponsesRequestCapabilities{
-		ChatToolLifecycle: req != nil && req.RequestType != llm.RequestTypeCompact,
+		ChatToolLifecycle: req != nil &&
+			req.RequestType != llm.RequestTypeCompact &&
+			req.APIFormat != llm.APIFormatOpenAIResponseCompact,
 	}
 }
 
@@ -218,9 +220,14 @@ func (t *OutboundTransformer) TransformRequest(ctx context.Context, llmReq *llm.
 		}
 		applySessionPromptCacheKey(ctx, oaiReq)
 	} else {
-		oaiReq = RequestFromLLM(ctx, llmReq, reasoningField)
+		var err error
+		oaiReq, err = RequestFromLLM(llmReq, reasoningField)
+		if err != nil {
+			return nil, err
+		}
 	}
-	//nolint:exhaustive // Checked.
+	applySessionPromptCacheKey(ctx, oaiReq)
+//nolint:exhaustive // Checked.
 	switch t.config.PlatformType {
 	case PlatformOpenAI:
 		stripUnsupportedToolCallExtraContent(oaiReq)
@@ -257,10 +264,10 @@ func (t *OutboundTransformer) TransformRequest(ctx context.Context, llmReq *llm.
 		}
 		transformerMetadata[responsesChatStrictFinishMetadataKey] = true
 		if mappings := toolAdapter.mappings(); len(mappings) > 0 {
-			transformerMetadata[responsesChatToolMappingsMetadataKey] = mappings
+			transformerMetadata[ResponsesChatToolMappingsMetadataKey] = mappings
 		}
 		if catalog := toolAdapter.catalog(); len(catalog) > 0 {
-			transformerMetadata[responsesChatToolCatalogMetadataKey] = catalog
+			transformerMetadata[ResponsesChatToolCatalogMetadataKey] = catalog
 		}
 		if len(toolAdapter.warnings) > 0 {
 			transformerMetadata[responsesChatToolWarningsMetadataKey] = append([]string(nil), toolAdapter.warnings...)
@@ -283,7 +290,7 @@ func (t *OutboundTransformer) TransformRequest(ctx context.Context, llmReq *llm.
 }
 
 func isResponsesAPIFormat(format llm.APIFormat) bool {
-	return format == llm.APIFormatOpenAIResponse || format == llm.APIFormatOpenAIResponseCompact
+	return llm.IsOpenAIResponsesFormat(format)
 }
 
 // TransformResponse transforms Response to ChatCompletionResponse.
@@ -384,97 +391,12 @@ func (t *OutboundTransformer) TransformStream(ctx context.Context, req *httpclie
 	}, nil
 }
 
-// responsesChatToolFlushStream releases tool calls the restorer still buffers
-// when the upstream stream ends without the finish chunk that would normally
-// release them. Without this, providers that omit finish_reason (or emit
-// [DONE] in its place) would silently drop every buffered call.
-type responsesChatToolFlushStream struct {
-	inner        streams.Stream[*llm.Response]
-	restorer     *responsesChatToolStreamRestorer
-	buffer       []*llm.Response
-	current      *llm.Response
-	flushed      bool
-	strictFinish bool
-}
-
-func (s *responsesChatToolFlushStream) Next() bool {
-	if len(s.buffer) > 0 {
-		s.popBuffered()
-		return true
-	}
-
-	if !s.inner.Next() {
-		s.current = nil
-		if s.inner.Err() == nil && s.syntheticFinishIfNeeded() {
-			s.popBuffered()
-			return true
-		}
-		if !s.strictFinish && !s.flushed && s.inner.Err() == nil {
-			s.flushed = true
-			s.buffer = s.restorer.flushBuffered()
-			if len(s.buffer) > 0 {
-				s.popBuffered()
-				return true
-			}
-		}
-		return false
-	}
-
-	// Insert flushed calls ahead of the [DONE] sentinel so downstream consumers
-	// that stop at a terminal event still observe them.
-	if current := s.inner.Current(); !s.flushed &&
-		(current == llm.DoneResponse || (current != nil && current.Object == "[DONE]")) {
-		if s.syntheticFinishIfNeeded() {
-			s.buffer = append(s.buffer, current)
-			s.popBuffered()
-			return true
-		}
-		if !s.strictFinish {
-			if flushed := s.restorer.flushBuffered(); len(flushed) > 0 {
-				s.flushed = true
-				s.buffer = append(flushed, current)
-				s.popBuffered()
-				return true
-			}
-		}
-	}
-
-	s.current = s.inner.Current()
-	return true
-}
-
-func (s *responsesChatToolFlushStream) popBuffered() {
-	s.current = s.buffer[0]
-	s.buffer = s.buffer[1:]
-}
-
-func (s *responsesChatToolFlushStream) syntheticFinishIfNeeded() bool {
-	if !s.strictFinish || s.flushed || s.restorer.sawFinish {
-		return false
-	}
-	finishReason := "error"
-	s.flushed = true
-	s.buffer = []*llm.Response{{
-		Object: "chat.completion.chunk",
-		Choices: []llm.Choice{{
-			Index: 0, Delta: &llm.Message{}, FinishReason: &finishReason,
-		}},
-	}}
-	return true
-}
-
-func (s *responsesChatToolFlushStream) Current() *llm.Response { return s.current }
-
-func (s *responsesChatToolFlushStream) Err() error { return s.inner.Err() }
-
-func (s *responsesChatToolFlushStream) Close() error { return s.inner.Close() }
-
 // responsesChatToolMappings retrieves per-request mappings used to restore Responses calls.
 func responsesChatToolMappings(req *httpclient.Request) map[string]responsesChatToolMapping {
 	if req == nil || req.TransformerMetadata == nil {
 		return nil
 	}
-	mappings, _ := req.TransformerMetadata[responsesChatToolMappingsMetadataKey].(map[string]responsesChatToolMapping)
+	mappings, _ := req.TransformerMetadata[ResponsesChatToolMappingsMetadataKey].(map[string]responsesChatToolMapping)
 	return mappings
 }
 
@@ -483,7 +405,7 @@ func responsesChatToolCatalog(req *httpclient.Request) []string {
 	if req == nil || req.TransformerMetadata == nil {
 		return nil
 	}
-	catalog, _ := req.TransformerMetadata[responsesChatToolCatalogMetadataKey].([]string)
+	catalog, _ := req.TransformerMetadata[ResponsesChatToolCatalogMetadataKey].([]string)
 	return catalog
 }
 

@@ -444,7 +444,7 @@ func TestOutboundTransformer_TransformRequest_ReplaysNamespaceTool(t *testing.T)
 	require.Equal(t, "get_weather", functionTool["name"])
 }
 
-func TestOutboundTransformer_TransformRequest_RejectsDuplicateNamespaces(t *testing.T) {
+func TestOutboundTransformer_TransformRequest_CombinesNonAdjacentNamespaceMembers(t *testing.T) {
 	llmReq := &llm.Request{Tools: []llm.Tool{
 		{Type: llm.ToolTypeFunction, Function: llm.Function{Name: "functions__one", Namespace: "functions", Parameters: []byte(`{"type":"object"}`)}},
 		{Type: llm.ToolTypeFunction, Function: llm.Function{Name: "mid", Parameters: []byte(`{"type":"object"}`)}},
@@ -454,8 +454,39 @@ func TestOutboundTransformer_TransformRequest_RejectsDuplicateNamespaces(t *test
 	outbound, err := NewOutboundTransformer("https://api.openai.com", "test-api-key")
 	require.NoError(t, err)
 	httpReq, err := outbound.TransformRequest(context.Background(), llmReq)
+	require.NoError(t, err)
+
+	var payload struct {
+		Tools []Tool `json:"tools"`
+	}
+	require.NoError(t, json.Unmarshal(httpReq.Body, &payload))
+	require.Len(t, payload.Tools, 2)
+	require.Equal(t, "namespace", payload.Tools[0].Type)
+	require.Equal(t, "functions", payload.Tools[0].Name)
+	require.Len(t, payload.Tools[0].Tools, 2)
+	require.Equal(t, "one", payload.Tools[0].Tools[0].Name)
+	require.Equal(t, "two", payload.Tools[0].Tools[1].Name)
+	require.Equal(t, "function", payload.Tools[1].Type)
+	require.Equal(t, "mid", payload.Tools[1].Name)
+}
+
+func TestOutboundTransformer_TransformRequest_RejectsConflictingNamespaceDescriptions(t *testing.T) {
+	llmReq := &llm.Request{Tools: []llm.Tool{
+		{
+			Type: llm.ToolTypeFunction, Function: llm.Function{Name: "functions__one", Namespace: "functions"},
+			ResponsesNamespaceDescription: "first",
+		},
+		{
+			Type: llm.ToolTypeFunction, Function: llm.Function{Name: "functions__two", Namespace: "functions"},
+			ResponsesNamespaceDescription: "second",
+		},
+	}}
+
+	outbound, err := NewOutboundTransformer("https://api.openai.com", "test-api-key")
+	require.NoError(t, err)
+	httpReq, err := outbound.TransformRequest(context.Background(), llmReq)
 	require.Nil(t, httpReq)
-	require.ErrorContains(t, err, `duplicate_namespace: namespace "functions" appears in multiple tool declarations`)
+	require.ErrorContains(t, err, `namespace_description_conflict: namespace "functions" has multiple descriptions`)
 }
 
 func TestOutboundTransformer_TransformRequest_RejectsNonCanonicalNamespaceFunctionName(t *testing.T) {

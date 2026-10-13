@@ -229,3 +229,18 @@ func TestNamespaceCompactOutputEncoding(t *testing.T) {
 	require.Equal(t, "docs__search", calls[0].Name)
 	require.Equal(t, "docs", calls[0].Namespace)
 }
+
+func responseWithTestMetadata(req *llm.Request, src *llm.Response) *llm.Response {
+	if src == nil || src == llm.DoneResponse {
+		return src
+	}
+	result := *src
+	result.TransformerMetadata = req.TransformerMetadata
+	return &result
+}
+
+func streamWithTestMetadata(req *llm.Request, source streams.Stream[*llm.Response]) streams.Stream[*llm.Response] {
+	return streams.MapErr(source, func(resp *llm.Response) (*llm.Response, error) {
+		return responseWithTestMetadata(req, resp), nil
+	})
+}

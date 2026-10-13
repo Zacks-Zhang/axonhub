@@ -2159,7 +2159,11 @@ func TestConvertToolChoiceToLLMPrimitiveMatrix(t *testing.T) {
 				})
 				require.NotNil(t, result)
 				require.Equal(t, mode, lo.FromPtr(result.ToolChoice))
-				require.Nil(t, result.NamedToolChoice)
+				// The unified model mirrors the allowlist into every legacy
+				// representation, the same shape llm.ToolChoice's own JSON
+				// decoder produces for an allowed_tools selector.
+				require.NotNil(t, result.NamedToolChoice)
+				require.Equal(t, "allowed_tools", result.NamedToolChoice.Type)
 				require.True(t, result.AllowedToolsSet)
 				require.Equal(t, []llm.ToolOption{
 					{Type: "function", Name: "same"},
@@ -2169,6 +2173,7 @@ func TestConvertToolChoiceToLLMPrimitiveMatrix(t *testing.T) {
 					{Type: "future_client_tool", Name: "later"},
 					{Type: "future_server_tool", Name: "hosted"},
 				}, result.AllowedTools)
+				require.Equal(t, result.AllowedTools, result.Tools)
 			})
 		}
 	})

@@ -5,6 +5,9 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/looplj/axonhub/llm"
+	"github.com/looplj/axonhub/llm/transformer/openai"
 )
 
 func TestSupportsNativeReasoningEffort(t *testing.T) {
@@ -163,5 +166,79 @@ func TestResolveZaiThinking(t *testing.T) {
 				assert.Equal(t, *tt.wantEffort, *effort)
 			}
 		})
+	}
+}
+func TestZAIRequestWithThinking(t *testing.T) {
+	chatReq := &llm.Request{
+		ReasoningEffort: "high",
+		Messages: []llm.Message{
+			{
+				Role: "user",
+				Content: llm.MessageContent{
+					Content: &[]string{"Hello, world!"}[0],
+				},
+			},
+		},
+	}
+
+	zaiReq := Request{}
+
+	if chatReq.ReasoningEffort != "" {
+		var thinkingType string
+		switch chatReq.ReasoningEffort {
+		case "none":
+			thinkingType = "disabled"
+		default:
+			thinkingType = "enabled"
+		}
+		zaiReq.Thinking = &Thinking{
+			Type: thinkingType,
+		}
+	}
+
+	if zaiReq.Thinking == nil {
+		t.Error("Expected Thinking to be non-nil when ReasoningEffort is set")
+	}
+
+	if zaiReq.Thinking.Type != "enabled" {
+		t.Errorf("Expected Thinking.Type to be 'enabled', got %s", zaiReq.Thinking.Type)
+	}
+}
+
+func TestZAIRequestWithoutThinking(t *testing.T) {
+	chatReq := &llm.Request{
+		Model: "gpt-4",
+		Messages: []llm.Message{
+			{
+				Role: "user",
+				Content: llm.MessageContent{
+					Content: &[]string{"Hello, world!"}[0],
+				},
+			},
+		},
+	}
+
+	oaiReq, err := openai.RequestFromLLM(chatReq, openai.ReasoningFieldContent)
+	require.NoError(t, err)
+	zaiReq := Request{
+		Request: *oaiReq,
+		UserID:  "test-user",
+	}
+
+	if chatReq.ReasoningEffort != "" {
+		var thinkingType string
+		switch chatReq.ReasoningEffort {
+		case "none":
+			thinkingType = "disabled"
+		default:
+			thinkingType = "enabled"
+		}
+		zaiReq.Thinking = &Thinking{
+			Type: thinkingType,
+		}
+	}
+
+	if zaiReq.Thinking != nil {
+		t.Error("Expected Thinking to be nil when ReasoningEffort is not set")
 	}
 }

@@ -414,13 +414,20 @@ func TestResponsesToChatTools_NamespaceFlattenedNameCollisionFailsStrictly(t *te
 			{"type":"namespace","name":"mcp__server","tools":[{"type":"function","name":"list","parameters":{"type":"object"}}]}
 		]
 	}`)})
-	require.NoError(t, err)
+	// The Responses inbound rejects flat-name collisions up front: ambiguous
+	// flattening would corrupt response-name decoding for every provider path.
+	require.ErrorIs(t, err, transformer.ErrInvalidRequest)
+	require.Nil(t, llmRequest)
 
-	chatOutbound, err := NewOutboundTransformer("https://chat.example.com", "test-key")
-	require.NoError(t, err)
-	chatRequest, err := chatOutbound.TransformRequest(ctx, llmRequest)
-	require.ErrorContains(t, err, `tool_name_conflict: Chat name "mcp__server__list" is required by namespace mcp.server__list and namespace mcp__server.list`)
-	require.Nil(t, chatRequest)
+	// Requests that bypass the Responses inbound still fail strictly in the
+	// Chat adapter, with both claimants named.
+	tools := []llm.Tool{
+		{Type: llm.ToolTypeFunction, Function: llm.Function{Name: "mcp__server__list", Namespace: "mcp", Parameters: json.RawMessage(`{"type":"object"}`)}},
+		{Type: llm.ToolTypeFunction, Function: llm.Function{Name: "mcp__server__list", Namespace: "mcp__server", Parameters: json.RawMessage(`{"type":"object"}`)}},
+	}
+	adapter := newResponsesChatToolAdapter(tools)
+	adapter.convertTools(tools)
+	require.ErrorContains(t, adapter.err, `tool_name_conflict: Chat name "mcp__server__list" is required by namespace mcp.server__list and namespace mcp__server.list`)
 }
 
 func TestResponsesToChatTools_NormalizesMissingObjectParameterTypes(t *testing.T) {
@@ -770,7 +777,7 @@ func TestResponsesToChatStream_MapsAbnormalFinishReasons(t *testing.T) {
 		{finishReason: "length", terminalType: responsesapi.StreamEventTypeResponseIncomplete, status: "incomplete", incompleteReason: "max_output_tokens"},
 		{finishReason: "content_filter", terminalType: responsesapi.StreamEventTypeResponseIncomplete, status: "incomplete", incompleteReason: "content_filter"},
 		{finishReason: "error", terminalType: responsesapi.StreamEventTypeResponseFailed, status: "failed"},
-		{finishReason: "cancelled", terminalType: responsesapi.StreamEventTypeResponseCancelled, status: "cancelled"},
+		{finishReason: "cancelled", terminalType: responsesapi.StreamEventTypeResponseCompleted, status: "cancelled"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.finishReason, func(t *testing.T) {
@@ -801,7 +808,7 @@ func TestResponsesToChatStream_AbnormalFinishDoesNotCompletePartialToolCalls(t *
 		{finishReason: "length", terminalType: responsesapi.StreamEventTypeResponseIncomplete, status: "incomplete"},
 		{finishReason: "content_filter", terminalType: responsesapi.StreamEventTypeResponseIncomplete, status: "incomplete"},
 		{finishReason: "error", terminalType: responsesapi.StreamEventTypeResponseFailed, status: "failed"},
-		{finishReason: "cancelled", terminalType: responsesapi.StreamEventTypeResponseCancelled, status: "cancelled"},
+		{finishReason: "cancelled", terminalType: responsesapi.StreamEventTypeResponseCompleted, status: "cancelled"},
 	}
 	states := []struct {
 		name     string
@@ -835,7 +842,9 @@ func TestResponsesToChatStream_AbnormalFinishDoesNotCompletePartialToolCalls(t *
 					if event.Type == responsesapi.StreamEventTypeOutputItemDone && event.Item != nil {
 						require.NotEqual(t, "custom_tool_call", event.Item.Type)
 					}
+				if terminal.terminalType != responsesapi.StreamEventTypeResponseCompleted {
 					require.NotEqual(t, responsesapi.StreamEventTypeResponseCompleted, event.Type)
+				}
 					if event.Type == responsesapi.StreamEventTypeOutputItemAdded && event.Item != nil && event.Item.Type == "custom_tool_call" {
 						added = true
 						require.Equal(t, "in_progress", lo.FromPtr(event.Item.Status))
@@ -1613,7 +1622,7 @@ func TestResponsesToChatCustomTool_UnwrapFallbackPreservesRawInput(t *testing.T)
 	}
 }
 
-func TestResponsesToChatCustomTool_RejectsGrammarConstraint(t *testing.T) {
+func TestResponsesToChatCustomTool_DegradesGrammarConstraint(t *testing.T) {
 	responsesInbound := responsesapi.NewInboundTransformer()
 	body := []byte(`{"model":"gpt-5.5","input":"apply the patch","tools":[
 		{"type":"custom","name":"apply_patch","format":{"type":"grammar","syntax":"lark","definition":"start: /.+/"}}
@@ -1623,41 +1632,59 @@ func TestResponsesToChatCustomTool_RejectsGrammarConstraint(t *testing.T) {
 	chatOutbound, err := NewOutboundTransformer("https://paratera.example.com", "test-key")
 	require.NoError(t, err)
 	chatRequest, err := chatOutbound.TransformRequest(t.Context(), llmRequest)
-	require.Nil(t, chatRequest)
-	require.ErrorContains(t, err, `unsupported_custom_tool_format: custom tool "apply_patch" format "grammar" cannot be enforced by Chat Completions`)
+	require.NoError(t, err)
+	require.NotNil(t, chatRequest)
+
+	var converted Request
+	require.NoError(t, json.Unmarshal(chatRequest.Body, &converted))
+	require.Len(t, converted.Tools, 1)
+	require.Equal(t, "apply_patch", converted.Tools[0].Function.Name)
+	require.Contains(t, converted.Tools[0].Function.Description, "lark grammar:")
+	require.Contains(t, converted.Tools[0].Function.Description, "start: /.+/")
+
+	warnings, ok := chatRequest.TransformerMetadata[responsesChatToolWarningsMetadataKey].([]string)
+	require.True(t, ok)
+	require.Contains(t, warnings, `grammar_constraint_degraded: custom tool "apply_patch" grammar is advisory after conversion to Chat Completions`)
 }
 
-func TestResponsesToChatTools_RejectNamespaceGrammarAndDeferLoading(t *testing.T) {
-	tests := []struct {
-		name          string
-		member        string
-		expectedError string
-	}{
-		{
-			name:          "custom grammar",
-			member:        `{"type":"custom","name":"exec","format":{"type":"future_format"}}`,
-			expectedError: `custom tool "exec" format "future_format" cannot be enforced`,
-		},
-		{
-			name:          "defer loading",
-			member:        `{"type":"function","name":"wait","parameters":{"type":"object"},"defer_loading":true}`,
-			expectedError: `function tool "functions__wait" uses defer_loading`,
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			responsesInbound := responsesapi.NewInboundTransformer()
-			body := []byte(`{"model":"gpt-5.5","input":"run","tools":[{
-				"type":"namespace","name":"functions","tools":[` + tt.member + `]}]}`)
-			llmRequest, err := responsesInbound.TransformRequest(t.Context(), &httpclient.Request{Body: body})
-			require.NoError(t, err)
-			chatOutbound, err := NewOutboundTransformer("https://chat.example.com", "test-key")
-			require.NoError(t, err)
-			chatRequest, err := chatOutbound.TransformRequest(t.Context(), llmRequest)
-			require.Nil(t, chatRequest)
-			require.ErrorContains(t, err, tt.expectedError)
-		})
-	}
+func TestResponsesToChatTools_RejectNamespaceDeferLoading(t *testing.T) {
+	responsesInbound := responsesapi.NewInboundTransformer()
+	body := []byte(`{"model":"gpt-5.5","input":"run","tools":[{
+		"type":"namespace","name":"functions","tools":[
+			{"type":"function","name":"wait","parameters":{"type":"object"},"defer_loading":true}
+		]}]}`)
+	llmRequest, err := responsesInbound.TransformRequest(t.Context(), &httpclient.Request{Body: body})
+	require.NoError(t, err)
+	chatOutbound, err := NewOutboundTransformer("https://chat.example.com", "test-key")
+	require.NoError(t, err)
+	chatRequest, err := chatOutbound.TransformRequest(t.Context(), llmRequest)
+	require.Nil(t, chatRequest)
+	require.ErrorContains(t, err, `function tool "functions__wait" uses defer_loading`)
+}
+
+func TestResponsesToChatTools_DegradesNamespaceCustomFormat(t *testing.T) {
+	responsesInbound := responsesapi.NewInboundTransformer()
+	body := []byte(`{"model":"gpt-5.5","input":"run","tools":[{
+		"type":"namespace","name":"functions","tools":[
+			{"type":"custom","name":"exec","format":{"type":"grammar","syntax":"lark","definition":"start: /.+/"}}
+		]}]}`)
+	llmRequest, err := responsesInbound.TransformRequest(t.Context(), &httpclient.Request{Body: body})
+	require.NoError(t, err)
+	chatOutbound, err := NewOutboundTransformer("https://chat.example.com", "test-key")
+	require.NoError(t, err)
+	chatRequest, err := chatOutbound.TransformRequest(t.Context(), llmRequest)
+	require.NoError(t, err)
+	require.NotNil(t, chatRequest)
+
+	var converted Request
+	require.NoError(t, json.Unmarshal(chatRequest.Body, &converted))
+	require.Len(t, converted.Tools, 1)
+	require.Equal(t, "functions__exec", converted.Tools[0].Function.Name)
+	require.Contains(t, converted.Tools[0].Function.Description, "start: /.+/")
+
+	warnings, ok := chatRequest.TransformerMetadata[responsesChatToolWarningsMetadataKey].([]string)
+	require.True(t, ok)
+	require.Contains(t, warnings, `grammar_constraint_degraded: custom tool "exec" grammar is advisory after conversion to Chat Completions`)
 }
 
 func responsesChatToolDelta(toolCall map[string]any) map[string]any {

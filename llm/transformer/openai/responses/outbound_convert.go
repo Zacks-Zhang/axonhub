@@ -344,8 +344,9 @@ func convertAssistantMessage(msg llm.Message) []Item {
 func convertToolMessageWithType(msg llm.Message, itemType string) Item {
 	if itemType == "tool_search_output" {
 		tools := []Tool{}
-		if msg.Content.Content != nil {
-			content := strings.TrimSpace(*msg.Content.Content)
+		content := toolSearchOutputText(msg.Content)
+		if msg.Content.Content != nil || len(msg.Content.MultipleContent) > 0 {
+			content = strings.TrimSpace(content)
 			if !strings.HasPrefix(content, "[") {
 				slog.Warn("failed to decode tool_search_output tools",
 					slog.String("call_id", lo.FromPtr(msg.ToolCallID)),
@@ -412,6 +413,19 @@ func convertToolMessageWithType(msg llm.Message, itemType string) Item {
 		CallID: lo.FromPtr(msg.ToolCallID),
 		Output: &output,
 	}
+}
+
+func toolSearchOutputText(content llm.MessageContent) string {
+	if content.Content != nil {
+		return *content.Content
+	}
+	var result strings.Builder
+	for _, part := range content.MultipleContent {
+		if part.Type == "text" && part.Text != nil {
+			result.WriteString(*part.Text)
+		}
+	}
+	return result.String()
 }
 
 func synchronizeToolSearchOutputMessages(
@@ -678,11 +692,20 @@ func convertToolChoice(src *llm.ToolChoice) *ToolChoice {
 		allowedType := "allowed_tools"
 		result.Type = &allowedType
 		result.Mode = src.ToolChoice
-		result.Tools = make([]ToolOption, 0, len(src.AllowedTools))
-		for _, tool := range src.AllowedTools {
+		// Tools is the authoritative member list: callers mutate it in place,
+		// while AllowedTools only mirrors it for serialized round trips that
+		// drop the legacy fields.
+		allowed := src.Tools
+		if len(allowed) == 0 {
+			allowed = src.AllowedTools
+		}
+		result.Tools = make([]ToolOption, 0, len(allowed))
+		for _, tool := range allowed {
 			result.Tools = append(result.Tools, ToolOption{Type: tool.Type, Name: tool.Name})
 		}
-	} else if src.ToolChoice != nil {
+		return result
+	}
+	if src.ToolChoice != nil {
 		// String mode like "none", "auto", "required"
 		result.Mode = src.ToolChoice
 	}

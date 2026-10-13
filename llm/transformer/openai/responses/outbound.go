@@ -241,11 +241,7 @@ func (t *OutboundTransformer) TransformRequest(ctx context.Context, llmReq *llm.
 	apiKey := t.config.APIKeyProvider.Get(ctx)
 
 	var tools []Tool
-<<<<<<< HEAD
-	namespaceIndexes := make(map[string]int)
-=======
 	namespaceMembers := make(map[string][]Tool)
->>>>>>> c805c9bf (feat(responses): preserve namespace tool compatibility)
 	requestExt := openAIResponsesRequestExtensions(llmReq)
 	replayRawInput := rawInputReplayMatchesCurrent(requestExt, llmReq.Messages, llmReq.Tools)
 	if err := validateUniqueNamespaceGroups(llmReq.Tools, replayRawInput, requestExt); err != nil {
@@ -296,14 +292,6 @@ func (t *OutboundTransformer) TransformRequest(ctx context.Context, llmReq *llm.
 		case "function":
 			tool := convertFunctionToTool(item)
 			if namespace := item.Function.Namespace; namespace != "" {
-<<<<<<< HEAD
-				if index, ok := namespaceIndexes[namespace]; ok {
-					tools[index].Tools = append(tools[index].Tools, tool)
-				} else {
-					namespaceIndexes[namespace] = len(tools)
-					tools = append(tools, Tool{Type: "namespace", Name: namespace, Tools: []Tool{tool}})
-				}
-=======
 				memberName, err := llm.NamespaceFunctionMemberName(item.Function)
 				if err != nil {
 					return nil, fmt.Errorf("%w: %w", transformer.ErrInvalidRequest, err)
@@ -313,7 +301,6 @@ func (t *OutboundTransformer) TransformRequest(ctx context.Context, llmReq *llm.
 					tool.Type = sourceType
 				}
 				rememberNamespaceMember(namespace, item.ResponsesNamespaceDescription, tool, namespaceMembers, &tools)
->>>>>>> c805c9bf (feat(responses): preserve namespace tool compatibility)
 			} else {
 				tools = append(tools, tool)
 			}
@@ -435,8 +422,8 @@ func validateUniqueNamespaceGroups(
 	replayRawInput bool,
 	requestExt *llm.OpenAIResponsesRequestExtensions,
 ) error {
-	seen := make(map[string]struct{})
 	rawSeen := make(map[string]struct{})
+	descriptions := make(map[string]string)
 	if requestExt != nil {
 		for _, fragment := range requestExt.RawTools {
 			if len(fragment.Raw) == 0 {
@@ -455,27 +442,24 @@ func validateUniqueNamespaceGroups(
 			rawSeen[rawTool.Name] = struct{}{}
 		}
 	}
-	active := ""
 	for _, tool := range tools {
 		if !responsesOriginToolEmitsTopLevel(tool, replayRawInput) {
 			continue
 		}
 		namespace := namespaceOfResponsesTool(tool)
 		if namespace == "" {
-			active = ""
 			continue
 		}
-		if namespace == active {
-			continue
-		}
-		if _, exists := seen[namespace]; exists {
+		description := tool.ResponsesNamespaceDescription
+		previous, exists := descriptions[namespace]
+		if !exists {
+			descriptions[namespace] = description
+		} else if previous != description {
 			return fmt.Errorf(
-				"%w: duplicate_namespace: namespace %q appears in multiple tool declarations",
+				"%w: namespace_description_conflict: namespace %q has multiple descriptions",
 				transformer.ErrInvalidRequest, namespace,
 			)
 		}
-		seen[namespace] = struct{}{}
-		active = namespace
 	}
 	return nil
 }

@@ -1,7 +1,6 @@
 package openai
 
 import (
-	"context"
 	"encoding/json"
 	"testing"
 
@@ -247,7 +246,7 @@ func TestRoundTrip_Request(t *testing.T) {
 
 	// Convert to llm.Request and back
 	llmReq := original.ToLLMRequest()
-	roundTripped := RequestFromLLM(context.Background(), llmReq, ReasoningFieldNone)
+	roundTripped := requireRequestFromLLM(t, llmReq, ReasoningFieldNone)
 
 	require.Equal(t, original.Model, roundTripped.Model)
 	require.Len(t, roundTripped.Messages, len(original.Messages))
@@ -333,7 +332,7 @@ func TestRoundTrip_AllowedToolsToolChoice(t *testing.T) {
 	var original Request
 	require.NoError(t, json.Unmarshal([]byte(raw), &original))
 
-	roundTripped := RequestFromLLM(context.Background(), original.ToLLMRequest(), ReasoningFieldNone)
+	roundTripped := requireRequestFromLLM(t, original.ToLLMRequest(), ReasoningFieldNone)
 	require.NotNil(t, roundTripped)
 
 	data, err := json.Marshal(roundTripped)
