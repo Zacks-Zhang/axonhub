@@ -26,6 +26,165 @@ import (
 // stays consistent across both sides.
 const ChatWrappedCustomMetadataKey = "openai_responses_chat_wrapped_custom"
 
+// IsToolInvocationText reports whether assistant text is a Codex-style tool
+// invocation rendering rather than prose. Models can emit that rendering in
+// addition to the structured tool call; the client re-parses it as a second,
+// empty invocation and aborts it.
+func IsToolInvocationText(text string) bool {
+	return strings.HasPrefix(strings.TrimSpace(text), "<tool")
+}
+
+const toolInvocationOpenPrefix = "<tool"
+
+// toolInvocationTextFilter strips Codex-style tool invocation rendering from
+// assistant text. The rendering may span several stream deltas and may be
+// interleaved with structured tool-call deltas, so block state persists across
+// message items for the whole response. After a rendering has been seen,
+// orphan tail fragments that lost their opening tag (split across tool-call
+// boundaries) are dropped too.
+type toolInvocationTextFilter struct {
+	inside    bool
+	blockName string
+	pending   string
+	seen      bool
+}
+
+// Filter returns the prose portion of in, dropping any tool invocation
+// rendering. Text held back as a possible partial marker stays in the filter
+// until more input arrives or Flush is called.
+func (f *toolInvocationTextFilter) Filter(in string) string {
+	f.pending += in
+
+	var out strings.Builder
+
+	for {
+		if f.inside {
+			closeTag := "</" + f.blockName + ">"
+			idx := strings.Index(f.pending, closeTag)
+			if idx < 0 {
+				f.pending = holdPartialMarker(f.pending, closeTag)
+				return out.String()
+			}
+			f.pending = f.pending[idx+len(closeTag):]
+			f.inside = false
+			f.blockName = ""
+			continue
+		}
+
+		idx := strings.Index(f.pending, toolInvocationOpenPrefix)
+		if idx < 0 {
+			hold := holdPartialMarker(f.pending, toolInvocationOpenPrefix)
+			candidate := f.pending[:len(f.pending)-len(hold)]
+			f.pending = hold
+			if f.seen && isOrphanToolInvocationFragment(candidate) {
+				continue
+			}
+			out.WriteString(candidate)
+			return out.String()
+		}
+
+		out.WriteString(f.pending[:idx])
+
+		rest := f.pending[idx:]
+		gt := strings.IndexByte(rest, '>')
+		if gt < 0 {
+			f.pending = rest
+			return out.String()
+		}
+
+		tag := rest[:gt+1]
+		f.pending = rest[gt+1:]
+
+		if strings.HasSuffix(tag[:len(tag)-1], "/") {
+			continue
+		}
+
+		name := toolInvocationTagName(tag)
+		if name == "" {
+			continue
+		}
+		f.inside = true
+		f.blockName = name
+		f.seen = true
+	}
+}
+
+// isOrphanToolInvocationFragment reports whether text is the tail of a tool
+// invocation rendering whose opening tag lived in an earlier message item.
+// Only closing-tag syntax is matched so bracketed prose like "[更新] ..." and
+// Markdown blockquotes stay.
+func isOrphanToolInvocationFragment(text string) bool {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return false
+	}
+	// A bare closing bracket left over from a split tag.
+	if trimmed == ">" || trimmed == "]" {
+		return true
+	}
+	for _, prefix := range []string{"</", "[/", "[parameter", "[function", "[tool"} {
+		if strings.HasPrefix(trimmed, prefix) {
+			return true
+		}
+	}
+	return strings.Contains(trimmed, "[/parameter]") ||
+		strings.Contains(trimmed, "[/function]") ||
+		strings.Contains(trimmed, "[/tool") ||
+		strings.Contains(trimmed, "</function") ||
+		strings.Contains(trimmed, "</tool")
+}
+
+// Flush returns any prose held back as a partial marker. Content still inside
+// an unterminated tool invocation block is dropped.
+func (f *toolInvocationTextFilter) Flush() string {
+	if f.inside {
+		f.pending = ""
+		return ""
+	}
+	out := f.pending
+	f.pending = ""
+	return out
+}
+
+// StripToolInvocationText removes complete tool invocation rendering blocks
+// from a finished text value.
+func StripToolInvocationText(text string) string {
+	f := &toolInvocationTextFilter{}
+	return f.Filter(text) + f.Flush()
+}
+
+// toolInvocationTagName returns the element name of an open tag such as
+// "<tool_call>"; attributes after the name are ignored.
+func toolInvocationTagName(tag string) string {
+	if len(tag) < 3 || tag[0] != '<' {
+		return ""
+	}
+	end := 1
+	for end < len(tag) && tag[end] != '>' && !isSpaceByte(tag[end]) {
+		end++
+	}
+	return tag[1:end]
+}
+
+func isSpaceByte(b byte) bool {
+	return b == ' ' || b == '\t' || b == '\n' || b == '\r'
+}
+
+// holdPartialMarker returns the longest suffix of s that is a proper prefix of
+// marker, so a marker split across stream deltas is not emitted as prose.
+func holdPartialMarker(s, marker string) string {
+	max := len(marker) - 1
+	if max > len(s) {
+		max = len(s)
+	}
+	for n := max; n > 0; n-- {
+		if strings.HasSuffix(s, marker[:n]) {
+			return s[len(s)-n:]
+		}
+	}
+	return ""
+}
+
 // UnwrapChatCustomInput recovers the raw custom-tool payload from the
 // {"input":"..."} wrapper the Chat tool adapter adds. Custom tools with a raw
 // or grammar format describe themselves as freeform input, so models sometimes
@@ -96,6 +255,11 @@ type responsesInboundStream struct {
 	responseCompleted       bool
 	finishReason            string
 	pendingAnnotations      []llm.Annotation
+
+	// toolTextFilter drops Codex-style tool invocation rendering from
+	// assistant text. Its block state spans the whole response because the
+	// rendering can be split across message items by interleaved tool calls.
+	toolTextFilter toolInvocationTextFilter
 
 	// Response metadata
 	responseID string
@@ -400,6 +564,21 @@ func (s *responsesInboundStream) Next() bool {
 			if err := s.flushPendingReasoning(); err != nil {
 				s.err = err
 				return false
+			}
+
+			// Surface any prose held back as a partial tool marker before
+			// closing the message item.
+			if tail := s.toolTextFilter.Flush(); tail != "" {
+				if s.hasReasoningItemStarted {
+					if err := s.closeReasoningItem(); err != nil {
+						s.err = err
+						return false
+					}
+				}
+				if err := s.emitTextContent(tail); err != nil {
+					s.err = err
+					return false
+				}
 			}
 
 			// Close any open content parts
@@ -804,6 +983,22 @@ func (s *responsesInboundStream) handleTextContent(content *string) error {
 		}
 	}
 
+	// A Codex-style model may render the invocation as assistant text in
+	// addition to the structured tool call. Clients re-parse that text as a
+	// second, empty invocation, so the rendering must not reach them. The
+	// filter keeps block state across message items so fragments split by
+	// interleaved tool-call deltas are dropped too.
+	filtered := s.toolTextFilter.Filter(*content)
+	if filtered == "" {
+		return nil
+	}
+
+	return s.emitTextContent(filtered)
+}
+
+// emitTextContent writes prose that has already been filtered into the current
+// message item, starting the item and content part as needed.
+func (s *responsesInboundStream) emitTextContent(text string) error {
 	// Start message output item if not started
 	if !s.hasMessageItemStarted {
 		s.hasMessageItemStarted = true
@@ -853,7 +1048,7 @@ func (s *responsesInboundStream) handleTextContent(content *string) error {
 	}
 
 	// Accumulate text content
-	s.accumulatedText.WriteString(*content)
+	s.accumulatedText.WriteString(text)
 
 	// Emit output_text.delta
 	err := s.enqueueEvent(&StreamEvent{
@@ -861,7 +1056,7 @@ func (s *responsesInboundStream) handleTextContent(content *string) error {
 		ItemID:       &s.currentItemID,
 		OutputIndex:  s.outputIndex,
 		ContentIndex: &s.contentIndex,
-		Delta:        *content,
+		Delta:        text,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to enqueue output_text.delta event: %w", err)

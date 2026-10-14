@@ -1141,3 +1141,64 @@ func TestInboundTransformer_TransformStream_EmitsErrorWhenUpstreamEndsWithoutRes
 	require.Equal(t, StreamEventTypeError, events[0].Type)
 	require.NotEmpty(t, events[0].Message)
 }
+
+func TestInboundTransformer_TransformStream_DropsFragmentedToolInvocationText(t *testing.T) {
+	openTag := "<" + "tool_call>"
+	closeTag := "</tool" + "_call>"
+	head := openTag + `const r=await tools.write_stdin({session_id:1,chars:"",yield`
+	tail := "[parameter=yield_time_ms]330000[/parameter][/function" + "]" + closeTag
+
+	source := streams.SliceStream([]*llm.Response{
+		{ID: "resp_frag", Model: "gpt-6-sol", Choices: []llm.Choice{{Index: 0, Delta: &llm.Message{
+			Content: llm.MessageContent{Content: lo.ToPtr("当前状态显示两个 pick 工作已部分完成。")},
+		}}}},
+		{ID: "resp_frag", Model: "gpt-6-sol", Choices: []llm.Choice{{Index: 0, Delta: &llm.Message{
+			Content:   llm.MessageContent{Content: lo.ToPtr(head)},
+			ToolCalls: []llm.ToolCall{{ID: "call_1", Index: 0, Function: llm.FunctionCall{Name: "exec"}}},
+		}}}},
+		{ID: "resp_frag", Model: "gpt-6-sol", Choices: []llm.Choice{{Index: 0, Delta: &llm.Message{
+			Content:   llm.MessageContent{Content: lo.ToPtr(tail)},
+			ToolCalls: []llm.ToolCall{{Index: 0, Function: llm.FunctionCall{Arguments: `text("x");`}}},
+		}}}},
+		{ID: "resp_frag", Model: "gpt-6-sol", Choices: []llm.Choice{{Index: 0, Delta: &llm.Message{}, FinishReason: lo.ToPtr("tool_calls")}}},
+		llm.DoneResponse,
+	})
+
+	stream, err := NewInboundTransformer().TransformStream(t.Context(), source)
+	require.NoError(t, err)
+
+	var (
+		textDeltas []string
+		msgDone    []string
+		toolDone   int
+	)
+	for stream.Next() {
+		var event StreamEvent
+		require.NoError(t, json.Unmarshal(stream.Current().Data, &event))
+		switch event.Type {
+		case StreamEventTypeOutputTextDelta:
+			textDeltas = append(textDeltas, event.Delta)
+		case StreamEventTypeOutputItemDone:
+			if event.Item == nil {
+				continue
+			}
+			switch event.Item.Type {
+			case "message":
+				for _, c := range event.Item.Content.Items {
+					if c.Text != nil {
+						msgDone = append(msgDone, *c.Text)
+					}
+				}
+			case "function_call", "custom_tool_call":
+				toolDone++
+			}
+		}
+	}
+	require.NoError(t, stream.Err())
+
+	require.Equal(t, []string{"当前状态显示两个 pick 工作已部分完成。"}, textDeltas,
+		"tool invocation fragments must not leak as text deltas")
+	require.Equal(t, []string{"当前状态显示两个 pick 工作已部分完成。"}, msgDone,
+		"message item must keep only prose")
+	require.Equal(t, 1, toolDone, "structured tool call must survive")
+}

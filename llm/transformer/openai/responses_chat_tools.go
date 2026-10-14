@@ -326,6 +326,7 @@ func responsesChatCustomToolDescription(tool *llm.ResponseCustomTool) string {
 		"Pass the exact raw custom-tool input as the string value of the `input` argument. " +
 		"The outer function arguments must be valid JSON: escape quotes, backslashes, and control characters " +
 		"only as required for that JSON string. Do not add Markdown code fences. " +
+		"Call this tool only through the structured function call; never also write the invocation as assistant text. " +
 		"Any original instruction below about not wrapping input in JSON applies to the `input` string itself; " +
 		"do not add another object or serialization layer inside it."
 

@@ -510,7 +510,49 @@ func convertInputToMessages(input *Input) ([]llm.Message, error) {
 		i++
 	}
 
+	stripAssistantToolInvocationText(messages)
+
 	return messages, nil
+}
+
+// stripAssistantToolInvocationText removes Codex-style tool invocation
+// rendering from assistant message text. The rendering may be split across
+// consecutive assistant messages by interleaved tool-call items, so one filter
+// spans the whole conversation. User messages pass through unchanged.
+func stripAssistantToolInvocationText(messages []llm.Message) {
+	filter := &toolInvocationTextFilter{}
+
+	for i := range messages {
+		if messages[i].Role != "assistant" {
+			continue
+		}
+
+		msg := &messages[i]
+		if msg.Content.Content != nil {
+			filtered := filter.Filter(*msg.Content.Content)
+			if filtered == "" {
+				msg.Content.Content = nil
+			} else {
+				msg.Content.Content = &filtered
+			}
+		}
+
+		for j := range msg.Content.MultipleContent {
+			part := &msg.Content.MultipleContent[j]
+			if part.Type != "text" || part.Text == nil {
+				continue
+			}
+			filtered := filter.Filter(*part.Text)
+			if filtered == "" {
+				part.Text = nil
+			} else {
+				part.Text = &filtered
+			}
+		}
+	}
+
+	// Drop held-back partial markers; they are not real conversation text.
+	_ = filter.Flush()
 }
 
 // collectToolCallOutputs returns the tool results belonging to toolCalls and
@@ -1532,23 +1574,26 @@ func convertToResponsesAPIResponse(chatResp *llm.Response) *Response {
 			}
 		}
 
-		// Handle text content
+		// Handle text content. Codex-style tool invocation rendering is
+		// stripped so clients do not re-parse it as a duplicate call.
 		if message.Content.Content != nil && *message.Content.Content != "" {
-			text := *message.Content.Content
-			contentItems, _ := attachAnnotationsToFirstTextItem([]Item{{
-				Type:        "output_text",
-				Text:        &text,
-				Annotations: []Annotation{},
-			}}, message.Annotations)
-			resp.Output = append(resp.Output, Item{
-				ID:   messageItemID,
-				Type: "message",
-				Role: "assistant",
-				Content: &Input{
-					Items: contentItems,
-				},
-				Status: lo.ToPtr("completed"),
-			})
+			text := StripToolInvocationText(*message.Content.Content)
+			if text != "" {
+				contentItems, _ := attachAnnotationsToFirstTextItem([]Item{{
+					Type:        "output_text",
+					Text:        &text,
+					Annotations: []Annotation{},
+				}}, message.Annotations)
+				resp.Output = append(resp.Output, Item{
+					ID:   messageItemID,
+					Type: "message",
+					Role: "assistant",
+					Content: &Input{
+						Items: contentItems,
+					},
+					Status: lo.ToPtr("completed"),
+				})
+			}
 		} else if len(message.Content.MultipleContent) > 0 {
 			contentItems := make([]Item, 0)
 
@@ -1556,7 +1601,10 @@ func convertToResponsesAPIResponse(chatResp *llm.Response) *Response {
 				switch part.Type {
 				case "text":
 					if part.Text != nil {
-						text := *part.Text
+						text := StripToolInvocationText(*part.Text)
+						if text == "" {
+							continue
+						}
 						contentItems = append(contentItems, Item{
 							Type:        "output_text",
 							Text:        &text,

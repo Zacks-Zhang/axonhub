@@ -3218,3 +3218,38 @@ func TestInboundTransformer_TransformRequest_MergesInterleavedToolOutputs(t *tes
 	require.Equal(t, "call_b", lo.FromPtr(result.Messages[3].ToolCallID))
 	require.Equal(t, "b1", flattenToolContent(t, result.Messages[3].Content))
 }
+
+func TestConvertInputToMessages_StripsFragmentedToolInvocationText(t *testing.T) {
+	openTag := "<" + "tool_call>"
+	closeTag := "</tool" + "_call>"
+	head := openTag + `const r=await tools.write_stdin({session_id:1,chars:"",yield`
+	tail := "[parameter=yield_time_ms]330000[/parameter][/function" + "]" + closeTag
+
+	input := &Input{Items: []Item{
+		{Type: "message", Role: "user", Content: &Input{Items: []Item{{Type: "input_text", Text: lo.ToPtr("continue")}}}},
+		{Type: "message", Role: "assistant", Content: &Input{Items: []Item{{Type: "output_text", Text: lo.ToPtr(head)}}}},
+		{Type: "message", Role: "assistant", Content: &Input{Items: []Item{{Type: "output_text", Text: lo.ToPtr("]")}}}},
+		{Type: "message", Role: "assistant", Content: &Input{Items: []Item{{Type: "output_text", Text: lo.ToPtr(tail)}}}},
+		{Type: "message", Role: "assistant", Content: &Input{Items: []Item{{Type: "output_text", Text: lo.ToPtr("我从中断点继续。")}}}},
+	}}
+
+	messages, err := convertInputToMessages(input)
+	require.NoError(t, err)
+
+	var texts []string
+	for _, msg := range messages {
+		if msg.Role != "assistant" {
+			continue
+		}
+		if msg.Content.Content != nil {
+			texts = append(texts, *msg.Content.Content)
+		}
+		for _, part := range msg.Content.MultipleContent {
+			if part.Text != nil {
+				texts = append(texts, *part.Text)
+			}
+		}
+	}
+	require.Equal(t, []string{"我从中断点继续。"}, texts,
+		"tool invocation fragments in history must be stripped before the upstream request")
+}
