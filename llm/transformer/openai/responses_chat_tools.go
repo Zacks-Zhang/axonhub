@@ -1166,12 +1166,7 @@ func restoreResponsesChatMessage(message *llm.Message, mappings map[string]respo
 		case responsesChatToolCustom:
 			input := call.Function.Arguments
 			if unwrapCustom {
-				var wrapper struct {
-					Input *string `json:"input"`
-				}
-				if json.Unmarshal([]byte(call.Function.Arguments), &wrapper) == nil && wrapper.Input != nil {
-					input = *wrapper.Input
-				}
+				input, _ = responsesapi.UnwrapChatCustomInput(input)
 			}
 			call.Type = llm.ToolTypeResponsesCustomTool
 			call.ResponseCustomToolCall = &llm.ResponseCustomToolCall{

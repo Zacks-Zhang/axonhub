@@ -26,6 +26,41 @@ import (
 // stays consistent across both sides.
 const ChatWrappedCustomMetadataKey = "openai_responses_chat_wrapped_custom"
 
+// UnwrapChatCustomInput recovers the raw custom-tool payload from the
+// {"input":"..."} wrapper the Chat tool adapter adds. Custom tools with a raw
+// or grammar format describe themselves as freeform input, so models sometimes
+// emit the bare payload and then repeat it inside the wrapper; when the whole
+// value is not itself wrapper JSON, a trailing wrapper is dropped in favour of
+// the raw prefix the model wrote first.
+//
+// The returned warning is non-empty only when the value looked like the wrapper
+// but could not be unwrapped, so freeform payloads stay silent.
+func UnwrapChatCustomInput(raw string) (string, string) {
+	const marker = `{"input":`
+	var wrapper struct {
+		Input *string `json:"input"`
+	}
+	err := json.Unmarshal([]byte(raw), &wrapper)
+	if err == nil && wrapper.Input != nil {
+		return *wrapper.Input, ""
+	}
+	if idx := strings.Index(raw, marker); idx > 0 {
+		var tail struct {
+			Input *string `json:"input"`
+		}
+		if tailErr := json.Unmarshal([]byte(raw[idx:]), &tail); tailErr == nil && tail.Input != nil {
+			return raw[:idx], ""
+		}
+	}
+	if err != nil {
+		if !strings.HasPrefix(strings.TrimSpace(raw), marker) {
+			return raw, ""
+		}
+		return raw, "failed to unwrap Chat custom tool input: " + err.Error()
+	}
+	return raw, "failed to unwrap Chat custom tool input: missing input field"
+}
+
 // TransformStream transforms the unified llm.Response stream to OpenAI Responses API SSE events.
 func (t *InboundTransformer) TransformStream(
 	ctx context.Context,
@@ -1404,21 +1439,11 @@ func (s *responsesInboundStream) closeCurrentOutputItem() error {
 			// Custom tool call - emit custom_tool_call_input.done then output_item.done
 			fullInput := tc.ResponseCustomToolCall.Input
 			if wrapped, _ := tc.TransformerMetadata[ChatWrappedCustomMetadataKey].(bool); wrapped {
-				var input struct {
-					Input *string `json:"input"`
-				}
-				if err := json.Unmarshal([]byte(fullInput), &input); err != nil {
-					slog.WarnContext(s.ctx, "failed to unwrap Chat custom tool input",
-						slog.String("call_id", tc.ResponseCustomToolCall.CallID),
-						slog.Any("error", err))
-					// Some compatible providers ignore the wrapper schema and emit raw
-					// custom input. Preserve it, matching the non-streaming fallback.
-				} else if input.Input == nil {
-					slog.WarnContext(s.ctx, "failed to unwrap Chat custom tool input",
-						slog.String("call_id", tc.ResponseCustomToolCall.CallID),
-						slog.String("error", "missing input field"))
-				} else {
-					fullInput = *input.Input
+				var warn string
+				fullInput, warn = UnwrapChatCustomInput(fullInput)
+				if warn != "" {
+					slog.WarnContext(s.ctx, warn,
+						slog.String("call_id", tc.ResponseCustomToolCall.CallID))
 				}
 				if fullInput != "" {
 					if err := s.enqueueEvent(&StreamEvent{
