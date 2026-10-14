@@ -238,7 +238,7 @@ func (r *responsesChatToolStreamRestorer) restore(response *llm.Response) {
 					}
 				}
 				potentialLongerName := r.isPotentialKnownName(call.Function.Name)
-				if mapping, ok := r.mappings[call.Function.Name]; ok && !mapping.HistoryOnly {
+				if mapping, ok := resolveResponsesChatToolMapping(r.mappings, call.Function.Name); ok && !mapping.HistoryOnly {
 					if call.ID == "" || potentialLongerName {
 						state.pending[call.Index] = call
 						continue
@@ -412,7 +412,7 @@ func (r *responsesChatToolStreamRestorer) releaseReady(
 
 // isKnownName reports whether a name exactly identifies a declared callable tool.
 func (r *responsesChatToolStreamRestorer) isKnownName(name string) bool {
-	if mapping, ok := r.mappings[name]; ok && !mapping.HistoryOnly {
+	if mapping, ok := resolveResponsesChatToolMapping(r.mappings, name); ok && !mapping.HistoryOnly {
 		return true
 	}
 	_, ok := r.catalog[name]

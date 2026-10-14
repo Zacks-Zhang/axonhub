@@ -1081,6 +1081,51 @@ func (a *responsesChatToolAdapter) mappings() map[string]responsesChatToolMappin
 	return a.registry.mappings()
 }
 
+// resolveResponsesChatToolMapping looks up a restored call by the name the
+// upstream model echoed. Callers key mappings by the emitted Chat name
+// (namespace__member), but models frequently echo the bare member name instead.
+// An exact Chat-name hit wins so a history-only bare definition keeps its
+// isolation from a namespaced declaration; otherwise fall back to a unique
+// member-name match, preferring one that is still callable.
+func resolveResponsesChatToolMapping(
+	mappings map[string]responsesChatToolMapping,
+	name string,
+) (responsesChatToolMapping, bool) {
+	if mapping, ok := mappings[name]; ok {
+		return mapping, true
+	}
+	if name == "" {
+		return responsesChatToolMapping{}, false
+	}
+	var (
+		active    responsesChatToolMapping
+		activeHit bool
+		fallback  responsesChatToolMapping
+		fallbackN int
+	)
+	for _, mapping := range mappings {
+		if mapping.Name != name {
+			continue
+		}
+		if !mapping.HistoryOnly {
+			if activeHit {
+				return responsesChatToolMapping{}, false
+			}
+			active = mapping
+			activeHit = true
+		}
+		fallback = mapping
+		fallbackN++
+	}
+	if activeHit {
+		return active, true
+	}
+	if fallbackN == 1 {
+		return fallback, true
+	}
+	return responsesChatToolMapping{}, false
+}
+
 // catalog returns the sorted callable Chat tool names used to recognize name fragments.
 func (a *responsesChatToolAdapter) catalog() []string {
 	if len(a.availableNames) == 0 {
@@ -1113,7 +1158,7 @@ func restoreResponsesChatToolCalls(response *llm.Response, mappings map[string]r
 func restoreResponsesChatMessage(message *llm.Message, mappings map[string]responsesChatToolMapping, unwrapCustom bool) {
 	for i := range message.ToolCalls {
 		call := &message.ToolCalls[i]
-		mapping, ok := mappings[call.Function.Name]
+		mapping, ok := resolveResponsesChatToolMapping(mappings, call.Function.Name)
 		if !ok || mapping.HistoryOnly {
 			continue
 		}
