@@ -837,11 +837,17 @@ func (a *responsesChatToolAdapter) findToolChoiceMapping(kind responsesChatToolK
 	return responsesChatToolMapping{}, false
 }
 
-// findFlattenedMapping resolves a canonical namespace__name identity.
+// findFlattenedMapping resolves a canonical namespace__name identity, falling
+// back to a bare member name so a selector can address a namespaced tool
+// without its flattened prefix.
 func (a *responsesChatToolAdapter) findFlattenedMapping(kind responsesChatToolKind, name string) (responsesChatToolMapping, bool) {
+	identities := a.registry.flattened(kind, name)
+	if len(identities) == 0 {
+		identities = a.registry.named(kind, name)
+	}
 	var found responsesChatToolMapping
 	matched := false
-	for _, identity := range a.registry.flattened(kind, name) {
+	for _, identity := range identities {
 		mapping, ok := a.registry.find(identity)
 		if !ok || mapping.Kind != kind {
 			continue

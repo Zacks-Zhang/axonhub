@@ -55,6 +55,7 @@ type responsesChatToolMappingRegistry struct {
 	byChatName            map[string]responsesChatToolMapping
 	byIdentity            map[toolIdentity]responsesChatToolMapping
 	identitiesByFlattened map[flattenedIdentityKey][]toolIdentity
+	identitiesByName      map[flattenedIdentityKey][]toolIdentity
 	identitiesByNamespace map[string][]toolIdentity
 	identitiesBySource    map[sourceIdentityKey][]toolIdentity
 	identitiesByClient    map[string][]toolIdentity
@@ -66,6 +67,7 @@ func newResponsesChatToolMappingRegistry() *responsesChatToolMappingRegistry {
 		byChatName:            make(map[string]responsesChatToolMapping),
 		byIdentity:            make(map[toolIdentity]responsesChatToolMapping),
 		identitiesByFlattened: make(map[flattenedIdentityKey][]toolIdentity),
+		identitiesByName:      make(map[flattenedIdentityKey][]toolIdentity),
 		identitiesByNamespace: make(map[string][]toolIdentity),
 		identitiesBySource:    make(map[sourceIdentityKey][]toolIdentity),
 		identitiesByClient:    make(map[string][]toolIdentity),
@@ -108,6 +110,10 @@ func (registry *responsesChatToolMappingRegistry) index(identity toolIdentity, m
 	flattened := namespaceChatName(identity.Name, identity.Namespace)
 	flattenedKey := flattenedIdentityKey{Kind: identity.Kind, Name: flattened}
 	registry.identitiesByFlattened[flattenedKey] = append(registry.identitiesByFlattened[flattenedKey], identity)
+	if identity.Name != "" {
+		nameKey := flattenedIdentityKey{Kind: identity.Kind, Name: identity.Name}
+		registry.identitiesByName[nameKey] = append(registry.identitiesByName[nameKey], identity)
+	}
 	if mapping.Namespace != "" {
 		registry.identitiesByNamespace[mapping.Namespace] = append(
 			registry.identitiesByNamespace[mapping.Namespace], identity,
@@ -124,6 +130,12 @@ func (registry *responsesChatToolMappingRegistry) index(identity toolIdentity, m
 
 func (registry *responsesChatToolMappingRegistry) flattened(kind responsesChatToolKind, name string) []toolIdentity {
 	return registry.identitiesByFlattened[flattenedIdentityKey{Kind: kind, Name: name}]
+}
+
+// named returns identities registered under a bare member name, so a selector
+// may address a namespaced tool without its flattened namespace prefix.
+func (registry *responsesChatToolMappingRegistry) named(kind responsesChatToolKind, name string) []toolIdentity {
+	return registry.identitiesByName[flattenedIdentityKey{Kind: kind, Name: name}]
 }
 
 func (registry *responsesChatToolMappingRegistry) namespace(namespace string) []toolIdentity {
