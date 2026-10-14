@@ -595,7 +595,12 @@ func (p *PersistentOutboundTransformer) TransformRequest(ctx context.Context, ll
 	if httpRequest.APIFormat != "" {
 		outboundFormat = llm.APIFormat(httpRequest.APIFormat)
 	}
-	if hasAdditionalTools && !isResponsesFormat(outboundFormat) {
+	// additional_tools raw fragments only matter for native Responses replay.
+	// The tools inside them are promoted to Request.Tools at inbound and
+	// converted like any other tool, so outbounds with the chat tool adapter
+	// can carry them; only outbounds that would silently drop them must fail.
+	if hasAdditionalTools && !isResponsesFormat(outboundFormat) &&
+		!transformer.ResponsesRequestCapabilitiesOf(p.wrapped, llmRequest).ChatToolLifecycle {
 		return nil, fmt.Errorf(
 			"%w: %w: additional_tools input items cannot be converted to %s",
 			transformer.ErrUnsupportedConversion,
