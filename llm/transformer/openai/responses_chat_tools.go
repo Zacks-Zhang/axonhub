@@ -171,11 +171,9 @@ func (a *responsesChatToolAdapter) convertTools(tools []llm.Tool) []Tool {
 				}
 				continue
 			}
+			deferLoading := tool.Function.DeferLoading
 			tool.Function = normalizedFunction
-			if tool.Function.DeferLoading {
-				a.setError(fmt.Errorf("unsupported_function_feature: function tool %q uses defer_loading, which Chat Completions cannot represent", tool.Function.Name))
-				continue
-			}
+			tool.Function.DeferLoading = false
 			signature, err := functionDefinitionSignature(tool.Function)
 			if err != nil {
 				if tool.Function.Namespace != "" {
@@ -219,6 +217,9 @@ func (a *responsesChatToolAdapter) convertTools(tools []llm.Tool) []Tool {
 				}
 				a.emittedPlain[tool.Function.Name] = struct{}{}
 				a.availableNames[tool.Function.Name] = struct{}{}
+			}
+			if deferLoading {
+				a.addWarningf("defer_loading_degraded: function tool %q is exposed eagerly because Chat Completions cannot defer tool loading", chatTool.Function.Name)
 			}
 			result = append(result, chatTool)
 
@@ -1066,11 +1067,10 @@ func functionDefinitionSignature(function llm.Function) (string, error) {
 		}
 	}
 	normalized, err := json.Marshal(struct {
-		Description  string `json:"description,omitempty"`
-		Parameters   any    `json:"parameters"`
-		Strict       *bool  `json:"strict,omitempty"`
-		DeferLoading bool   `json:"defer_loading,omitempty"`
-	}{Description: function.Description, Parameters: parameters, Strict: function.Strict, DeferLoading: function.DeferLoading})
+		Description string `json:"description,omitempty"`
+		Parameters  any    `json:"parameters"`
+		Strict      *bool  `json:"strict,omitempty"`
+	}{Description: function.Description, Parameters: parameters, Strict: function.Strict})
 	if err != nil {
 		return "", err
 	}

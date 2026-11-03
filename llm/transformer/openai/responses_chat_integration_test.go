@@ -842,9 +842,9 @@ func TestResponsesToChatStream_AbnormalFinishDoesNotCompletePartialToolCalls(t *
 					if event.Type == responsesapi.StreamEventTypeOutputItemDone && event.Item != nil {
 						require.NotEqual(t, "custom_tool_call", event.Item.Type)
 					}
-				if terminal.terminalType != responsesapi.StreamEventTypeResponseCompleted {
-					require.NotEqual(t, responsesapi.StreamEventTypeResponseCompleted, event.Type)
-				}
+					if terminal.terminalType != responsesapi.StreamEventTypeResponseCompleted {
+						require.NotEqual(t, responsesapi.StreamEventTypeResponseCompleted, event.Type)
+					}
 					if event.Type == responsesapi.StreamEventTypeOutputItemAdded && event.Item != nil && event.Item.Type == "custom_tool_call" {
 						added = true
 						require.Equal(t, "in_progress", lo.FromPtr(event.Item.Status))
@@ -1647,7 +1647,7 @@ func TestResponsesToChatCustomTool_DegradesGrammarConstraint(t *testing.T) {
 	require.Contains(t, warnings, `grammar_constraint_degraded: custom tool "apply_patch" grammar is advisory after conversion to Chat Completions`)
 }
 
-func TestResponsesToChatTools_RejectNamespaceDeferLoading(t *testing.T) {
+func TestResponsesToChatTools_DegradesNamespaceDeferLoading(t *testing.T) {
 	responsesInbound := responsesapi.NewInboundTransformer()
 	body := []byte(`{"model":"gpt-5.5","input":"run","tools":[{
 		"type":"namespace","name":"functions","tools":[
@@ -1658,8 +1658,17 @@ func TestResponsesToChatTools_RejectNamespaceDeferLoading(t *testing.T) {
 	chatOutbound, err := NewOutboundTransformer("https://chat.example.com", "test-key")
 	require.NoError(t, err)
 	chatRequest, err := chatOutbound.TransformRequest(t.Context(), llmRequest)
-	require.Nil(t, chatRequest)
-	require.ErrorContains(t, err, `function tool "functions__wait" uses defer_loading`)
+	require.NoError(t, err)
+	require.NotNil(t, chatRequest)
+
+	var converted Request
+	require.NoError(t, json.Unmarshal(chatRequest.Body, &converted))
+	require.Len(t, converted.Tools, 1)
+	require.Equal(t, "functions__wait", converted.Tools[0].Function.Name)
+
+	warnings, ok := chatRequest.TransformerMetadata[responsesChatToolWarningsMetadataKey].([]string)
+	require.True(t, ok)
+	require.Contains(t, warnings, `defer_loading_degraded: function tool "functions__wait" is exposed eagerly because Chat Completions cannot defer tool loading`)
 }
 
 func TestResponsesToChatTools_DegradesNamespaceCustomFormat(t *testing.T) {
@@ -2296,6 +2305,9 @@ func TestResponsesToChatTools_NamespaceDedupDeferLoadingAndInvalid(t *testing.T)
 		{Type: llm.ToolTypeFunction, Function: llm.Function{Name: "ws__read", Namespace: "ws", Description: "other", Parameters: json.RawMessage(`{"type":"object"}`)}},
 		// Invalid schema: dropped with a warning.
 		{Type: llm.ToolTypeFunction, Function: llm.Function{Name: "ws__bad", Namespace: "ws", Parameters: json.RawMessage(`{"type":"string"}`)}},
+		// Deferred and eager definitions of the same tool deduplicate after degradation.
+		{Type: llm.ToolTypeFunction, Function: llm.Function{Name: "ws__later", Namespace: "ws", Parameters: json.RawMessage(`{"type":"object"}`), DeferLoading: true}},
+		{Type: llm.ToolTypeFunction, Function: llm.Function{Name: "ws__later", Namespace: "ws", Parameters: json.RawMessage(`{"type":"object"}`)}},
 	}
 
 	adapter := newResponsesChatToolAdapter(tools)
@@ -2305,11 +2317,13 @@ func TestResponsesToChatTools_NamespaceDedupDeferLoadingAndInvalid(t *testing.T)
 	for _, tool := range result {
 		names = append(names, tool.Function.Name)
 	}
-	require.Equal(t, []string{"ws__read"}, names)
+	require.Equal(t, []string{"ws__read", "ws__later"}, names)
 	require.ErrorContains(t, adapter.err, "tool_definition_conflict: namespace ws.read has multiple different definitions")
 
 	warnings := strings.Join(adapter.warnings, "\n")
 	require.Contains(t, warnings, "invalid namespace tool")
+	require.Contains(t, warnings, `defer_loading_degraded: function tool "ws__later" is exposed eagerly because Chat Completions cannot defer tool loading`)
+	require.Equal(t, 1, strings.Count(warnings, "defer_loading_degraded"))
 }
 
 func TestResponsesChatAllowedToolChoiceSignaturesAndDegradation(t *testing.T) {

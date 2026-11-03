@@ -2,6 +2,7 @@ package openai
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -308,7 +309,7 @@ func TestResponsesChatToolAdapter_RevalidatesEveryAssistantPayloadForm(t *testin
 	}
 }
 
-func TestResponsesChatToolAdapter_RejectsDeferredFunction(t *testing.T) {
+func TestResponsesChatToolAdapter_DegradesDeferredFunction(t *testing.T) {
 	request := &llm.Request{Tools: []llm.Tool{{
 		Type: llm.ToolTypeFunction,
 		Function: llm.Function{
@@ -317,15 +318,19 @@ func TestResponsesChatToolAdapter_RejectsDeferredFunction(t *testing.T) {
 	}}}
 
 	chatRequest, adapter, err := requestFromLLMWithResponsesToolAdapter(request, ReasoningFieldNone)
-	require.Nil(t, chatRequest)
-	require.ErrorContains(t, err, `unsupported_function_feature: function tool "deferred_lookup" uses defer_loading, which Chat Completions cannot represent`)
-	require.NotContains(t, strings.Join(adapter.warnings, "\n"), "defer_loading_degraded")
+	require.NoError(t, err)
+	require.NotNil(t, chatRequest)
+	require.Len(t, chatRequest.Tools, 1)
+	require.Equal(t, "deferred_lookup", chatRequest.Tools[0].Function.Name)
+	require.Contains(t, adapter.warnings, `defer_loading_degraded: function tool "deferred_lookup" is exposed eagerly because Chat Completions cannot defer tool loading`)
+	require.Equal(t, 1, strings.Count(strings.Join(adapter.warnings, "\n"), "defer_loading_degraded"))
 }
 
-func TestResponsesChatToolAdapter_RejectsDeferredFunctionForEveryOrigin(t *testing.T) {
+func TestResponsesChatToolAdapter_DegradesDeferredFunctionForEveryOrigin(t *testing.T) {
 	tests := []struct {
-		name string
-		tool llm.Tool
+		name     string
+		tool     llm.Tool
+		wantName string
 	}{
 		{
 			name: "namespace function",
@@ -336,6 +341,7 @@ func TestResponsesChatToolAdapter_RejectsDeferredFunctionForEveryOrigin(t *testi
 					Parameters: json.RawMessage(`{"type":"object"}`), DeferLoading: true,
 				},
 			},
+			wantName: "workspace__later",
 		},
 		{
 			name: "future client function",
@@ -346,18 +352,51 @@ func TestResponsesChatToolAdapter_RejectsDeferredFunctionForEveryOrigin(t *testi
 				},
 				ResponsesOrigin: "raw_tool", ResponsesSourceType: "future_client_tool",
 			},
+			wantName: "later",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			chatRequest, _, err := requestFromLLMWithResponsesToolAdapter(&llm.Request{
+			chatRequest, adapter, err := requestFromLLMWithResponsesToolAdapter(&llm.Request{
 				Tools: []llm.Tool{tt.tool},
 			}, ReasoningFieldNone)
-			require.Nil(t, chatRequest)
-			require.ErrorContains(t, err, "uses defer_loading, which Chat Completions cannot represent")
+			require.NoError(t, err)
+			require.NotNil(t, chatRequest)
+			require.Len(t, chatRequest.Tools, 1)
+			require.Equal(t, tt.wantName, chatRequest.Tools[0].Function.Name)
+			require.Contains(t, adapter.warnings, fmt.Sprintf(
+				`defer_loading_degraded: function tool %q is exposed eagerly because Chat Completions cannot defer tool loading`,
+				tt.wantName,
+			))
+			require.Equal(t, 1, strings.Count(strings.Join(adapter.warnings, "\n"), "defer_loading_degraded"))
 		})
 	}
+}
+
+func TestResponsesChatToolAdapter_DeduplicatesDeferredAndEagerFunction(t *testing.T) {
+	tools := []llm.Tool{
+		{
+			Type: llm.ToolTypeFunction,
+			Function: llm.Function{
+				Name: "same_definition", Parameters: json.RawMessage(`{"type":"object"}`), DeferLoading: true,
+			},
+		},
+		{
+			Type: llm.ToolTypeFunction,
+			Function: llm.Function{
+				Name: "same_definition", Parameters: json.RawMessage(`{"type":"object"}`),
+			},
+		},
+	}
+
+	adapter := newResponsesChatToolAdapter(tools)
+	result := adapter.convertTools(tools)
+
+	require.NoError(t, adapter.err)
+	require.Len(t, result, 1)
+	require.Equal(t, "same_definition", result[0].Function.Name)
+	require.Equal(t, 1, strings.Count(strings.Join(adapter.warnings, "\n"), "defer_loading_degraded"))
 }
 
 func TestResponsesChatToolStreamRestorer_UsesToolCallIndexForLaterChunks(t *testing.T) {
